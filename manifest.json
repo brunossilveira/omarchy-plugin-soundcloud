@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "brunosilveira.soundcloud",
+  "name": "SoundCloud",
+  "version": "0.1.0",
+  "author": "Bruno Silveira",
+  "description": "SoundCloud playback and account controls in the Omarchy bar",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "SoundCloud",
+    "description": "Now playing, Likes, feed, and playback controls",
+    "category": "Media",
+    "allowMultiple": false
+  }
+}
