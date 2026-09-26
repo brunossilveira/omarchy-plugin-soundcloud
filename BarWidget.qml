@@ -15,52 +15,313 @@ BarWidget {
   property bool playing: false
   property string title: ""
   property string artist: ""
-  property string artUrl: ""
+  property string artDataUrl: ""
   property real duration: 0
   property real position: 0
   property string lastError: ""
   property bool actionBusy: false
+  property string selectedTab: "home"
+  property var tracks: []
+  property var homeTracks: []
+  property var feedTracks: []
+  property var trackArtworkData: ({})
+  property var trackArtworkPending: ({})
+  property bool tracksLoading: false
+  property int trackLoadAttempts: 0
+  property bool tracksRequestPending: false
+  property int nextRequestId: 1
+  property var pendingRequests: ({})
+  property bool connectionInitialized: false
+  // Probe an existing daemon so shell restarts preserve playback, but never
+  // launch one until the user interacts with the plugin.
+  property bool backendWanted: true
+  property bool socketProbePending: true
+  property bool launchingBackend: false
+  property string socketBuffer: ""
+  readonly property int maxSocketFrameChars: 262144
+  property bool hasTrack: title !== ""
+  readonly property var activeSocket: socketLoader.item
+  readonly property bool backendConnected: !!(activeSocket && activeSocket.connected)
 
   readonly property string helperPath: {
     var value = Qt.resolvedUrl("soundcloud_app.py").toString()
     return value.indexOf("file://") === 0 ? decodeURIComponent(value.substring(7)) : value
   }
+  readonly property string socketPath: {
+    var runtime = Quickshell.env("XDG_RUNTIME_DIR")
+    return runtime ? String(runtime) + "/omarchy-soundcloud/control.sock" : ""
+  }
   readonly property string label: SoundCloudModel.displayLabel({ trackTitle: title, trackArtist: artist })
+  readonly property string safeTooltipLabel: plainForHost(label)
   readonly property string playIcon: playing ? "󰏤" : "󰐊"
-  readonly property color dim: Qt.darker(bar.barForeground, 1.5)
+  readonly property color dim: Qt.darker(bar.foreground, 1.5)
+  readonly property color barDim: Qt.darker(bar.barForeground, 1.5)
 
   function close() { popupOpen = false }
 
-  function refresh() {
-    if (statusProcess.running) return
-    statusProcess.command = ["python3", helperPath, "status"]
-    statusProcess.running = true
+  function plainForHost(value) {
+    return String(value || "")
+      .replace(/[<>&\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, "")
+      .slice(0, 256)
   }
 
-  function runAction(action) {
-    if (actionProcess.running) return
-    actionBusy = true
-    lastError = ""
-    actionProcess.command = ["python3", helperPath, action]
-    actionProcess.running = true
+  function startBackend(showWindow) {
+    if (launcherProcess.running) return
+    backendWanted = true
+    launchingBackend = true
+    socketProbePending = true
+    launcherProcess.command = ["/usr/bin/python3", "-I", helperPath, showWindow ? "launch" : "ensure"]
+    launcherProcess.running = true
   }
 
-  function applyStatus(raw) {
-    try {
-      var state = JSON.parse(String(raw || "{}"))
-      running = state.running === true
-      loggedIn = state.loggedIn === true
-      playing = state.playing === true
-      title = String(state.title || "")
-      artist = String(state.artist || "")
-      artUrl = String(state.artUrl || "")
-      duration = Number(state.duration || 0)
-      position = Number(state.position || 0)
-      if (state.error) lastError = String(state.error)
-    } catch (error) {
-      lastError = "Could not read SoundCloud status"
+  function refreshTracks() {
+    if (!popupOpen || tracksRequestPending || !backendConnected || !running || !loggedIn) return
+    tracksLoading = true
+    trackLoadAttempts += 1
+    tracksRequestPending = sendCommand("tracks:" + selectedTab, "tracks:" + selectedTab) > 0
+  }
+
+  function selectTab(tab) {
+    selectedTab = tab
+    tracks = tab === "home" ? homeTracks : feedTracks
+    tracksLoading = true
+    trackLoadAttempts = 0
+    runAction(tab)
+    refreshTracks()
+  }
+
+  function applyTracks(result, sourceTab) {
+    var cached = sourceTab === "home" ? homeTracks : feedTracks
+    var applied = SoundCloudModel.applyTrackResult(cached, result)
+    if (!result || result.pending !== true) {
+      if (sourceTab === "home") homeTracks = applied.tracks
+      else if (sourceTab === "feed") feedTracks = applied.tracks
+    }
+    if (selectedTab === sourceTab) tracks = applied.tracks
+    if (result && result.error) lastError = String(result.error)
+    if (selectedTab === sourceTab) tracksLoading = applied.loading
+  }
+
+  function requestTrackArtwork(artworkId) {
+    artworkId = String(artworkId || "")
+    if (!/^[0-9a-f]{24}$/.test(artworkId)
+        || trackArtworkData[artworkId]
+        || trackArtworkPending[artworkId]) return
+    var pending = Object.assign({}, trackArtworkPending)
+    pending[artworkId] = true
+    trackArtworkPending = pending
+    if (sendCommand("artwork:" + artworkId, "artwork:" + artworkId) === 0) {
+      delete pending[artworkId]
+      trackArtworkPending = Object.assign({}, pending)
     }
   }
+
+  function commandValue(action, value) {
+    if (action === "launch") return "show"
+    if (action === "seek") return "seek:" + String(value)
+    if (action === "play-url") return "play-url:" + String(value)
+    return action
+  }
+
+  function sendCommand(command, kind) {
+    var socket = activeSocket
+    if (!socket || !socket.connected) return 0
+    var id = nextRequestId++
+    pendingRequests[String(id)] = String(kind || "action")
+    var payload = { id: id, command: command }
+    socket.write(JSON.stringify(payload) + "\n")
+    socket.flush()
+    return id
+  }
+
+  function initializeConnection() {
+    if (!backendConnected) {
+      resetConnectionState()
+      return
+    }
+    if (connectionInitialized) return
+    connectionInitialized = true
+    running = true
+    launchingBackend = false
+    socketProbePending = false
+    actionBusy = false
+    reconnectAttempt = 0
+    sendCommand("subscribe", "subscribe")
+    sendCommand("status", "status")
+    if (popupOpen && running && loggedIn) {
+      sendCommand(selectedTab, "action")
+      trackReloadTimer.restart()
+    }
+  }
+
+  function resetConnectionState() {
+    connectionInitialized = false
+    socketBuffer = ""
+    pendingRequests = ({})
+    tracksRequestPending = false
+    trackArtworkPending = ({})
+    tracksLoading = false
+    trackLoadAttempts = 0
+    actionBusy = false
+  }
+
+  function runAction(action, value) {
+    if (actionBusy) return false
+    if (!backendConnected) {
+      actionBusy = true
+      startBackend(action === "launch" || action === "show")
+      return true
+    }
+    actionBusy = true
+    lastError = ""
+    if (sendCommand(commandValue(action, value), "action") > 0) return true
+    actionBusy = false
+    return false
+  }
+
+  function formatTime(seconds) {
+    var value = Math.max(0, Math.floor(Number(seconds) || 0))
+    var hours = Math.floor(value / 3600)
+    var minutes = Math.floor((value % 3600) / 60)
+    var remainder = value % 60
+    if (hours > 0) {
+      return hours + ":" + (minutes < 10 ? "0" : "") + minutes
+        + ":" + (remainder < 10 ? "0" : "") + remainder
+    }
+    return minutes + ":" + (remainder < 10 ? "0" : "") + remainder
+  }
+
+  function formatCompactCount(value) {
+    value = Math.max(0, Math.floor(Number(value) || 0))
+    if (value < 1000) return String(value)
+    var units = [[1000000000, "B"], [1000000, "M"], [1000, "K"]]
+    for (var index = 0; index < units.length; index++) {
+      if (value >= units[index][0]) {
+        var compact = (value / units[index][0]).toFixed(value >= units[index][0] * 10 ? 0 : 1)
+        return compact.replace(/\.0$/, "") + units[index][1]
+      }
+    }
+    return String(value)
+  }
+
+  function trackDetails(track) {
+    var details = [String(track.artist || "SoundCloud")]
+    var playCount = Math.max(0, Math.floor(Number(track.playCount) || 0))
+    var durationMs = Math.max(0, Math.floor(Number(track.durationMs) || 0))
+    details.push(playCount > 0 ? "▶ " + formatCompactCount(playCount) : "▶ —")
+    details.push(durationMs > 0 ? formatTime(durationMs / 1000) : "—:—")
+    return details.join("  •  ")
+  }
+
+  function applyStatus(state) {
+    state = state || ({})
+    running = state.running === true
+    var wasLoggedIn = loggedIn
+    var reportsLoggedOut = /\/(signin|register)([/?#]|$)/.test(String(state.url || ""))
+    loggedIn = state.loggedIn === true || (root.loggedIn && !reportsLoggedOut)
+    if (state.error) lastError = String(state.error)
+    var hasIncomingTrack = String(state.title || "") !== ""
+    var preserveMetadata = !hasIncomingTrack && root.title !== ""
+      && /^https:\/\/soundcloud\.com\/(discover|feed)([/?#]|$)/.test(String(state.url || ""))
+    playing = state.playing === true
+    duration = Number(state.duration || 0)
+    position = Number(state.position || 0)
+    if (!preserveMetadata) {
+      var incomingTitle = String(state.title || "").slice(0, 512)
+      var artwork = String(state.artDataUrl || "")
+      if (/^data:image\/(png|jpeg);base64,/.test(artwork) && artwork.length <= 180000) {
+        artDataUrl = artwork
+      } else if (incomingTitle !== title) {
+        artDataUrl = ""
+      }
+      title = incomingTitle
+      artist = String(state.artist || "").slice(0, 256)
+    }
+    if (popupOpen && loggedIn && !wasLoggedIn && tracks.length === 0) {
+      sendCommand(selectedTab, "action")
+      trackReloadTimer.restart()
+    }
+  }
+
+  function handleLine(line) {
+    if (String(line || "").length > maxSocketFrameChars) {
+      lastError = "SoundCloud response exceeded the security limit"
+      return
+    }
+    var message
+    try {
+      message = JSON.parse(String(line || ""))
+    } catch (error) {
+      lastError = "Could not read SoundCloud response"
+      return
+    }
+    if (message.type === "status") {
+      applyStatus(message.state)
+      return
+    }
+    if (message.type === "tracks") {
+      applyTracks(message, String(message.source || ""))
+      if (message.cached !== true) trackLoadAttempts = 50
+      return
+    }
+    if (message.type !== "response") return
+    var key = String(message.id || "")
+    var kind = pendingRequests[key]
+    delete pendingRequests[key]
+    if (kind === "status") applyStatus(message)
+    else if (kind && kind.indexOf("tracks:") === 0) {
+      tracksRequestPending = false
+      var sourceTab = kind.substring(7)
+      applyTracks(message, sourceTab)
+      if (popupOpen && selectedTab === sourceTab
+          && message.pending === true && trackLoadAttempts < 50) {
+        trackReloadTimer.restart()
+      } else if (popupOpen && selectedTab !== sourceTab) {
+        trackLoadAttempts = 0
+        trackReloadTimer.restart()
+      }
+    } else if (kind && kind.indexOf("artwork:") === 0) {
+      var artworkId = kind.substring(8)
+      var pendingArtwork = Object.assign({}, trackArtworkPending)
+      delete pendingArtwork[artworkId]
+      trackArtworkPending = pendingArtwork
+      var trackArtDataUrl = String(message.artDataUrl || "")
+      if (message.ok === true
+          && /^data:image\/(png|jpeg);base64,/.test(trackArtDataUrl)
+          && trackArtDataUrl.length <= 45000) {
+        var artworkData = Object.assign({}, trackArtworkData)
+        if (Object.keys(artworkData).length >= 64) artworkData = ({})
+        artworkData[artworkId] = trackArtDataUrl
+        trackArtworkData = artworkData
+      }
+    } else if (kind === "action") {
+      actionBusy = false
+      if (message.ok !== true) lastError = String(message.error || "SoundCloud action failed")
+    }
+  }
+
+  function handleSocketChunk(chunk) {
+    socketBuffer += String(chunk || "")
+    var newline
+    while ((newline = socketBuffer.indexOf("\n")) >= 0) {
+      var line = socketBuffer.substring(0, newline)
+      socketBuffer = socketBuffer.substring(newline + 1)
+      if (line.length > maxSocketFrameChars) {
+        socketBuffer = ""
+        lastError = "SoundCloud response exceeded the security limit"
+        if (activeSocket) activeSocket.connected = false
+        return
+      }
+      if (line !== "") handleLine(line)
+    }
+    if (socketBuffer.length > maxSocketFrameChars) {
+      socketBuffer = ""
+      lastError = "SoundCloud response exceeded the security limit"
+      if (activeSocket) activeSocket.connected = false
+    }
+  }
+
+  onBackendConnectedChanged: initializeConnection()
 
   visible: true
   implicitWidth: row.implicitWidth + Style.space(14)
@@ -73,23 +334,13 @@ BarWidget {
 
     Text {
       anchors.verticalCenter: parent.verticalCenter
+      textFormat: Text.PlainText
       text: ""
-      color: root.running ? root.bar.barForeground : root.dim
+      color: root.running ? root.bar.barForeground : root.barDim
       font.family: root.bar.fontFamily
       font.pixelSize: Style.font.body
     }
 
-    Text {
-      anchors.verticalCenter: parent.verticalCenter
-      visible: !root.bar.vertical && root.title !== ""
-      width: Math.min(Style.space(180), implicitWidth)
-      textFormat: Text.PlainText
-      text: root.label
-      color: root.bar.barForeground
-      font.family: root.bar.fontFamily
-      font.pixelSize: Style.font.body
-      elide: Text.ElideRight
-    }
   }
 
   MouseArea {
@@ -101,13 +352,17 @@ BarWidget {
     onClicked: function(mouse) {
       if (mouse.button === Qt.MiddleButton) root.runAction(root.running ? "play-pause" : "launch")
       else if (mouse.button === Qt.RightButton && root.running) root.runAction("next")
-      else root.popupOpen = !root.popupOpen
+      else {
+        root.popupOpen = !root.popupOpen
+        if (root.popupOpen && !root.backendConnected) root.startBackend(false)
+        else if (root.popupOpen && root.tracks.length === 0) root.selectTab(root.selectedTab)
+      }
     }
     onWheel: function(wheel) {
       if (!root.running) return
       root.runAction(wheel.angleDelta.y > 0 ? "previous" : "next")
     }
-    onEntered: root.bar.showTooltip(root, root.label)
+    onEntered: root.bar.showTooltip(root, root.safeTooltipLabel)
     onExited: root.bar.hideTooltip(root)
   }
 
@@ -117,13 +372,34 @@ BarWidget {
     bar: root.bar
     owner: root
     open: root.popupOpen
-    contentWidth: popup.fittedContentWidth(Style.space(340))
-    contentHeight: popup.fittedContentHeight(content.implicitHeight)
+    contentWidth: popup.fittedContentWidth(Style.space(408))
+    contentHeight: popup.fittedContentHeight(Style.space(480))
 
     Column {
       id: content
       anchors.fill: parent
       spacing: Style.space(12)
+
+      Row {
+        anchors.horizontalCenter: parent.horizontalCenter
+        spacing: Style.space(8)
+
+        Button {
+          text: "Home"
+          foreground: root.bar.foreground
+          enabled: !root.actionBusy
+          opacity: root.selectedTab === "home" ? 1 : 0.55
+          onClicked: root.selectTab("home")
+        }
+
+        Button {
+          text: "Feed"
+          foreground: root.bar.foreground
+          enabled: !root.actionBusy
+          opacity: root.selectedTab === "feed" ? 1 : 0.55
+          onClicked: root.selectTab("feed")
+        }
+      }
 
       Row {
         width: parent.width
@@ -141,13 +417,16 @@ BarWidget {
             anchors.margins: Style.space(2)
             fillMode: Image.PreserveAspectCrop
             asynchronous: true
-            source: root.artUrl
+            sourceSize.width: 256
+            sourceSize.height: 256
+            source: root.artDataUrl
             visible: source !== ""
           }
 
           Text {
             anchors.centerIn: parent
-            visible: root.artUrl === ""
+            visible: root.artDataUrl === ""
+            textFormat: Text.PlainText
             text: ""
             color: root.bar.foreground
             font.family: root.bar.fontFamily
@@ -174,7 +453,7 @@ BarWidget {
           Text {
             width: parent.width
             textFormat: Text.PlainText
-            text: root.artist || (!root.running ? "Backend is stopped" : (!root.loggedIn ? "Sign in once to continue" : "Choose Likes or Following"))
+            text: root.artist || (!root.running ? "Backend is stopped" : (!root.loggedIn ? "Sign in once to continue" : "Nothing playing"))
             color: root.dim
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -187,11 +466,12 @@ BarWidget {
         anchors.horizontalCenter: parent.horizontalCenter
         spacing: Style.space(7)
         visible: root.running && root.loggedIn
+        opacity: root.hasTrack ? 1 : 0.45
 
         Button {
           iconText: "󰒮"
           foreground: root.bar.foreground
-          enabled: !root.actionBusy
+          enabled: !root.actionBusy && root.hasTrack
           opacity: enabled ? 1 : 0.4
           onClicked: root.runAction("previous")
         }
@@ -199,14 +479,14 @@ BarWidget {
           iconText: root.playIcon
           foreground: root.bar.foreground
           iconSize: Style.font.iconLarge
-          enabled: !root.actionBusy && root.title !== ""
+          enabled: !root.actionBusy && root.hasTrack
           opacity: enabled ? 1 : 0.4
           onClicked: root.runAction("play-pause")
         }
         Button {
           iconText: "󰒭"
           foreground: root.bar.foreground
-          enabled: !root.actionBusy
+          enabled: !root.actionBusy && root.hasTrack
           opacity: enabled ? 1 : 0.4
           onClicked: root.runAction("next")
         }
@@ -217,22 +497,206 @@ BarWidget {
         foreground: root.bar.foreground
       }
 
-      Row {
-        anchors.horizontalCenter: parent.horizontalCenter
-        spacing: Style.space(8)
+      Column {
+        width: parent.width
+        spacing: Style.space(3)
+        visible: root.running && root.loggedIn
+        opacity: root.hasTrack ? 1 : 0.45
+
+        Canvas {
+          id: waveform
+          width: parent.width
+          height: Style.space(42)
+
+          property real playedRatio: root.duration > 0
+            ? Math.max(0, Math.min(1, root.position / root.duration))
+            : 0
+
+          onPlayedRatioChanged: requestPaint()
+          onWidthChanged: requestPaint()
+          onHeightChanged: requestPaint()
+
+          Connections {
+            target: root.bar
+            function onForegroundChanged() { waveform.requestPaint() }
+          }
+
+          onPaint: {
+            var context = getContext("2d")
+            context.reset()
+            var count = 76
+            var gap = 2
+            var barWidth = Math.max(1, (width - (count - 1) * gap) / count)
+            for (var index = 0; index < count; index++) {
+              var shape = Math.abs(Math.sin(index * 1.73) * Math.cos(index * 0.37))
+              var barHeight = Math.max(3, height * (0.18 + shape * 0.78))
+              var x = index * (barWidth + gap)
+              var y = (height - barHeight) / 2
+              context.fillStyle = index / count <= playedRatio
+                ? "#ff5500"
+                : Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.28)
+              context.fillRect(x, y, barWidth, barHeight)
+            }
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            enabled: root.hasTrack && root.duration > 0 && !root.actionBusy
+            onClicked: function(mouse) {
+              var ratio = Math.max(0, Math.min(1, mouse.x / width))
+              root.position = root.duration * ratio
+              waveform.requestPaint()
+              root.runAction("seek", ratio)
+            }
+          }
+        }
+
+        Row {
+          width: parent.width
+
+          Text {
+            textFormat: Text.PlainText
+            text: root.formatTime(root.position)
+            color: root.dim
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Item { width: parent.width - parent.children[0].implicitWidth - parent.children[2].implicitWidth; height: 1 }
+
+          Text {
+            textFormat: Text.PlainText
+            text: root.formatTime(root.duration)
+            color: root.dim
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+      }
+
+      Item {
+        width: parent.width
+        height: Math.max(0, parent.height - y - (errorText.visible
+          ? errorText.implicitHeight + parent.spacing : 0))
         visible: root.running && root.loggedIn
 
-        Button {
-          text: "Likes"
-          foreground: root.bar.foreground
-          enabled: !root.actionBusy
-          onClicked: root.runAction("likes")
+        ListView {
+          id: trackList
+          anchors.fill: parent
+          anchors.rightMargin: Style.space(6)
+          clip: true
+          spacing: Style.space(3)
+          boundsBehavior: Flickable.StopAtBounds
+          model: root.tracks
+
+          delegate: Item {
+            required property var modelData
+            width: trackList.width
+            height: Style.space(56)
+            property var track: modelData
+            property string artworkId: String(track.artworkId || "")
+            property string trackArtDataUrl: String(root.trackArtworkData[artworkId] || "")
+
+            Component.onCompleted: root.requestTrackArtwork(artworkId)
+            onArtworkIdChanged: root.requestTrackArtwork(artworkId)
+
+            Rectangle {
+              id: trackArtwork
+              width: Style.space(48)
+              height: Style.space(48)
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08)
+
+              Image {
+                anchors.fill: parent
+                fillMode: Image.PreserveAspectCrop
+                asynchronous: true
+                sourceSize.width: 96
+                sourceSize.height: 96
+                source: trackArtDataUrl
+                visible: trackArtDataUrl !== ""
+              }
+
+              Text {
+                anchors.centerIn: parent
+                visible: trackArtDataUrl === ""
+                textFormat: Text.PlainText
+                text: ""
+                color: root.dim
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.icon
+              }
+            }
+
+            Column {
+              anchors.left: trackArtwork.right
+              anchors.leftMargin: Style.space(9)
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(2)
+
+              Text {
+                width: parent.width
+                text: track.title || "Untitled"
+                textFormat: Text.PlainText
+                color: root.bar.foreground
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.body
+                elide: Text.ElideRight
+              }
+
+              Text {
+                width: parent.width
+                text: root.trackDetails(track)
+                textFormat: Text.PlainText
+                color: root.dim
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+            }
+
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              enabled: !root.actionBusy
+              onClicked: {
+                root.runAction("play-url", track.url)
+              }
+            }
+          }
         }
-        Button {
-          text: "Following"
-          foreground: root.bar.foreground
-          enabled: !root.actionBusy
-          onClicked: root.runAction("feed")
+
+        Rectangle {
+          anchors.right: parent.right
+          width: Style.space(2)
+          y: trackList.visibleArea.yPosition * parent.height
+          height: Math.max(Style.space(18), trackList.visibleArea.heightRatio * parent.height)
+          radius: width / 2
+          color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.35)
+          visible: trackList.visibleArea.heightRatio < 1
+        }
+
+        Text {
+          anchors.centerIn: parent
+          visible: root.tracksLoading && root.tracks.length === 0
+          textFormat: Text.PlainText
+          text: "Loading " + (root.selectedTab === "home" ? "Home" : "Feed") + "…"
+          color: root.dim
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.body
+        }
+
+        Text {
+          anchors.centerIn: parent
+          visible: !root.tracksLoading && root.tracks.length === 0
+          textFormat: Text.PlainText
+          text: "No tracks found"
+          color: root.dim
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.body
         }
       }
 
@@ -246,6 +710,7 @@ BarWidget {
       }
 
       Text {
+        id: errorText
         width: parent.width
         visible: root.lastError !== ""
         textFormat: Text.PlainText
@@ -256,63 +721,79 @@ BarWidget {
         wrapMode: Text.WordWrap
       }
 
-      Text {
-        width: parent.width
-        textFormat: Text.PlainText
-        text: "Middle-click: play/pause  ·  Right-click: next  ·  Wheel: previous/next"
-        color: root.dim
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.caption
-        wrapMode: Text.WordWrap
-        horizontalAlignment: Text.AlignHCenter
+    }
+  }
+
+  Timer {
+    id: trackReloadTimer
+    interval: 100
+    repeat: false
+    onTriggered: root.refreshTracks()
+  }
+
+  Timer {
+    interval: 30000
+    repeat: true
+    running: root.backendConnected
+    onTriggered: root.sendCommand("status", "status")
+  }
+
+  Component {
+    id: socketComponent
+
+    Socket {
+      path: root.socketPath
+      connected: root.backendWanted && root.socketPath !== ""
+      parser: SplitParser {
+        splitMarker: ""
+        onRead: function(chunk) { root.handleSocketChunk(chunk) }
+      }
+      onConnectionStateChanged: {
+        if (connected) root.initializeConnection()
+        else {
+          root.resetConnectionState()
+          root.running = false
+        }
       }
     }
   }
 
+  Loader {
+    id: socketLoader
+    active: false
+    sourceComponent: socketComponent
+  }
+
+  property int reconnectAttempt: 0
+
   Timer {
-    interval: 1500
-    repeat: true
-    running: true
+    id: reconnectTimer
+    interval: Math.min(1500, 100 + root.reconnectAttempt * 100)
+    repeat: root.launchingBackend
     triggeredOnStart: true
-    onTriggered: root.refresh()
-  }
-
-  Timer {
-    id: delayedRefresh
-    interval: 450
-    repeat: false
-    onTriggered: root.refresh()
-  }
-
-  Process {
-    id: statusProcess
-    running: false
-    command: []
-    stdout: StdioCollector {
-      id: statusOutput
-      waitForEnd: true
-    }
-    onExited: function(_exitCode) {
-      root.applyStatus(statusOutput.text)
+    running: root.backendWanted && !root.backendConnected
+      && (root.socketProbePending || root.launchingBackend)
+    onTriggered: {
+      root.socketProbePending = false
+      root.reconnectAttempt = Math.min(14, root.reconnectAttempt + 1)
+      socketLoader.active = false
+      socketLoader.active = true
     }
   }
 
   Process {
-    id: actionProcess
+    id: launcherProcess
     running: false
     command: []
-    stdout: StdioCollector {
-      id: actionOutput
-      waitForEnd: true
-    }
-    stderr: StdioCollector {
-      id: actionError
-      waitForEnd: true
-    }
     onExited: function(exitCode) {
-      root.actionBusy = false
-      if (exitCode !== 0) root.lastError = String(actionError.text || "SoundCloud action failed").trim()
-      delayedRefresh.restart()
+      if (exitCode !== 0) {
+        root.actionBusy = false
+        root.launchingBackend = false
+        root.lastError = "Could not start SoundCloud"
+      } else {
+        root.socketProbePending = true
+      }
+      reconnectTimer.restart()
     }
   }
 }

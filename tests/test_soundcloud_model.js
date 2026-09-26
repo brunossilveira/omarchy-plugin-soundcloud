@@ -26,4 +26,17 @@ assert.equal(model.pickPlayer([chrome]), null);
 assert.equal(model.displayLabel({ trackTitle: "Track", trackArtist: "Artist" }), "Track  ·  Artist");
 assert.equal(model.displayLabel(null), "SoundCloud");
 
+const cachedFeed = [{ title: "Cached feed track" }];
+const pendingFeed = model.applyTrackResult(cachedFeed, { pending: true, tracks: [] });
+assert.deepEqual(pendingFeed.tracks, cachedFeed);
+assert.equal(pendingFeed.loading, true);
+
+const refreshedFeed = [{ title: "Refreshed feed track" }];
+const completedFeed = model.applyTrackResult(pendingFeed.tracks, {
+  pending: false,
+  tracks: refreshedFeed,
+});
+assert.deepEqual(completedFeed.tracks, refreshedFeed);
+assert.equal(completedFeed.loading, false);
+
 console.log("SoundCloudModel tests passed");

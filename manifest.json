@@ -13,7 +13,7 @@
   },
   "barWidget": {
     "displayName": "SoundCloud",
-    "description": "Now playing, Likes, feed, and playback controls",
+    "description": "Now playing, Home, Feed, and playback controls",
     "category": "Media",
     "allowMultiple": false
   }

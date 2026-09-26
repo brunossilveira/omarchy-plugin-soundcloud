@@ -32,12 +32,22 @@ function displayLabel(player) {
   return title || artist || "SoundCloud"
 }
 
+function applyTrackResult(cachedTracks, result) {
+  var cached = Array.isArray(cachedTracks) ? cachedTracks : []
+  if (result && result.pending === true) {
+    return { tracks: cached, loading: true }
+  }
+  var incoming = result && Array.isArray(result.tracks) ? result.tracks.slice(0, 50) : []
+  return { tracks: incoming, loading: false }
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     searchablePlayerText: searchablePlayerText,
     isExactSoundCloudPlayer: isExactSoundCloudPlayer,
     isWebKitPlayer: isWebKitPlayer,
     pickPlayer: pickPlayer,
-    displayLabel: displayLabel
+    displayLabel: displayLabel,
+    applyTrackResult: applyTrackResult
   }
 }
