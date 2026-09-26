@@ -3,6 +3,7 @@ import json
 import os
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -196,6 +197,38 @@ class GraphicsWorkaroundTest(unittest.TestCase):
 
 
 class BackendCommandTest(unittest.TestCase):
+    def test_pagination_event_log_is_dedicated_sanitized_and_rotated(self):
+        app = load_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "pagination.log"
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            setattr(app, "_event_log_fd", fd)
+            setattr(app, "MAX_EVENT_LOG_BYTES", 320)
+            try:
+                app.log_event("untrusted-event", secret="must-not-appear")
+                for count in range(12):
+                    app.log_event(
+                        "track-page",
+                        source="feed",
+                        addedCount=count,
+                        hasMore=True,
+                        secret="must-not-appear",
+                    )
+            finally:
+                app.close_runtime_event_log()
+
+            contents = path.read_text()
+            self.assertLessEqual(path.stat().st_size, app.MAX_EVENT_LOG_BYTES)
+            self.assertNotIn("must-not-appear", contents)
+            for line in contents.splitlines():
+                record = json.loads(line)
+                self.assertEqual(record["event"], "track-page")
+                self.assertEqual(record["source"], "feed")
+
+        source = MODULE_PATH.read_text()
+        self.assertIn("stderr=subprocess.DEVNULL", source)
+        self.assertIn("pass_fds=(event_log_fd,)", source)
+
     def test_runtime_socket_uses_xdg_runtime_dir(self):
         app = load_module()
 
@@ -382,6 +415,199 @@ class BackendCommandTest(unittest.TestCase):
         self.assertIsNone(app.track_source_from_command("tracks"))
         self.assertIsNone(app.track_source_from_command("tracks:https://evil.example"))
 
+    def test_load_more_command_allows_only_route_bound_sources(self):
+        app = load_module()
+
+        self.assertEqual(app.load_more_source_from_command("load-more:home"), "home")
+        self.assertEqual(app.load_more_source_from_command("load-more:feed"), "feed")
+        self.assertIsNone(app.load_more_source_from_command("load-more"))
+        self.assertIsNone(app.load_more_source_from_command("load-more:likes"))
+
+    def test_track_pages_append_unique_tracks_and_new_navigation_resets(self):
+        app = load_module()
+        first = [
+            {"url": "https://soundcloud.com/artist/one", "title": "One"},
+            {"url": "https://soundcloud.com/artist/two", "title": "Two"},
+        ]
+        second = [
+            {"url": "https://soundcloud.com/artist/two", "title": "Two updated"},
+            {"url": "https://soundcloud.com/artist/three", "title": "Three"},
+        ]
+
+        self.assertEqual(
+            [track["title"] for track in app.merge_track_pages(first, second, reset=False, limit=10)],
+            ["One", "Two updated", "Three"],
+        )
+        self.assertEqual(
+            app.merge_track_pages(first, second, reset=True, limit=10),
+            second,
+        )
+
+    def test_load_more_script_scrolls_only_the_selected_route(self):
+        app = load_module()
+
+        home_script = app.load_more_script("home")
+        feed_script = app.load_more_script("feed")
+
+        self.assertIn('__omarchyLoadMore("home")', home_script)
+        self.assertIn('__omarchyLoadMore("feed")', feed_script)
+        self.assertNotIn("window.scrollTo", home_script)
+        self.assertIsNone(app.load_more_script("likes"))
+
+    def test_load_more_fetches_the_validated_next_api_page_without_dom_scrolling(self):
+        app = load_module()
+        capture_script = app.api_request_capture_script()
+        harness = f"""
+const captureScript = {json.dumps(capture_script)};
+const posted = [];
+const calls = [];
+const pages = [
+  {{ collection: [{{ permalink_url: 'https://soundcloud.com/a/one', title: 'One', duration: 1000, user: {{ username: 'A' }} }}], next_href: 'https://api-v2.soundcloud.com/stream?offset=10' }},
+  {{ collection: [{{ permalink_url: 'https://soundcloud.com/b/two', title: 'Two', duration: 1000, user: {{ username: 'B' }} }}], next_href: null }}
+];
+global.location = {{ href: 'https://soundcloud.com/feed', hostname: 'soundcloud.com', pathname: '/feed' }};
+global.window = global;
+window.webkit = {{ messageHandlers: {{ omarchyTracks: {{ postMessage(value) {{ posted.push(JSON.parse(value)); }} }} }} }};
+window.fetch = async function(input, init) {{
+  calls.push(typeof input === 'string' ? input : input.url);
+  const body = JSON.stringify(pages.shift());
+  return {{ ok: true, clone() {{ return this; }}, async text() {{ return body; }} }};
+}};
+global.XMLHttpRequest = function() {{}};
+XMLHttpRequest.prototype.open = function() {{}};
+XMLHttpRequest.prototype.setRequestHeader = function() {{}};
+XMLHttpRequest.prototype.send = function() {{}};
+XMLHttpRequest.prototype.addEventListener = function() {{}};
+eval(captureScript);
+(async () => {{
+  await window.fetch(new Request('https://api-v2.soundcloud.com/stream?offset=0', {{
+    headers: {{ authorization: 'OAuth private-test-value' }}
+  }}));
+  await new Promise(setImmediate);
+  const started = window.__omarchyLoadMore('feed');
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  const exhausted = window.__omarchyLoadMore('feed');
+  process.stdout.write(JSON.stringify({{ started, exhausted, calls, posted, globals: Object.keys(window) }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+        completed = subprocess.run(
+            ["node", "-e", harness],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        result = json.loads(completed.stdout)
+
+        self.assertTrue(result["started"])
+        self.assertEqual(result["calls"], [
+            "https://api-v2.soundcloud.com/stream?offset=0",
+            "https://api-v2.soundcloud.com/stream?offset=10",
+        ])
+        self.assertEqual([message["tracks"][0]["title"] for message in result["posted"]], ["One", "Two"])
+        self.assertFalse(result["posted"][1]["hasMore"])
+        self.assertEqual(result["exhausted"], {"started": False, "hasMore": False})
+        self.assertNotIn("private-test-value", completed.stdout)
+
+    def test_failed_load_more_emits_a_retryable_completion_event(self):
+        app = load_module()
+        capture_script = app.api_request_capture_script()
+        harness = f"""
+const posted = [];
+let callCount = 0;
+global.location = {{ href: 'https://soundcloud.com/feed' }};
+global.window = global;
+window.webkit = {{ messageHandlers: {{ omarchyTracks: {{ postMessage(value) {{ posted.push(JSON.parse(value)); }} }} }} }};
+window.fetch = async function() {{
+  callCount += 1;
+  if (callCount > 1) return {{ ok: false, status: 503 }};
+  const body = JSON.stringify({{
+    collection: [{{ permalink_url: 'https://soundcloud.com/a/one', title: 'One', duration: 1000 }}],
+    next_href: 'https://api-v2.soundcloud.com/stream?offset=10'
+  }});
+  return {{ ok: true, clone() {{ return this; }}, async text() {{ return body; }} }};
+}};
+global.XMLHttpRequest = function() {{}};
+XMLHttpRequest.prototype.open = function() {{}};
+XMLHttpRequest.prototype.setRequestHeader = function() {{}};
+XMLHttpRequest.prototype.send = function() {{}};
+XMLHttpRequest.prototype.addEventListener = function() {{}};
+eval({json.dumps(capture_script)});
+(async () => {{
+  await window.fetch(new Request('https://api-v2.soundcloud.com/stream?offset=0'));
+  await new Promise(setImmediate);
+  const started = window.__omarchyLoadMore('feed');
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  const retried = window.__omarchyLoadMore('feed');
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  process.stdout.write(JSON.stringify({{ started, retried, callCount, posted }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+        completed = subprocess.run(
+            ["node", "-e", harness],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        result = json.loads(completed.stdout)
+
+        self.assertEqual(result["started"], {"started": True, "hasMore": True})
+        self.assertEqual(result["retried"], {"started": True, "hasMore": True})
+        self.assertEqual(result["callCount"], 3)
+        self.assertEqual(len(result["posted"]), 3)
+        self.assertEqual(result["posted"][1]["tracks"], [])
+        self.assertTrue(result["posted"][1]["hasMore"])
+        self.assertEqual(result["posted"][1]["addedCount"], 0)
+        self.assertEqual(result["posted"][1]["error"], "Could not load more tracks")
+
+    def test_load_more_stops_before_requesting_a_cursor_cycle(self):
+        app = load_module()
+        capture_script = app.api_request_capture_script()
+        harness = f"""
+const calls = [];
+const pages = [
+  {{ collection: [{{ permalink_url: 'https://soundcloud.com/a/one', title: 'One', duration: 1 }}], next_href: 'https://api-v2.soundcloud.com/stream?offset=10' }},
+  {{ collection: [{{ permalink_url: 'https://soundcloud.com/a/two', title: 'Two', duration: 1 }}], next_href: 'https://api-v2.soundcloud.com/stream?offset=0' }}
+];
+global.location = {{ href: 'https://soundcloud.com/feed' }};
+global.window = global;
+window.webkit = {{ messageHandlers: {{ omarchyTracks: {{ postMessage() {{}} }} }} }};
+window.fetch = async function(input) {{
+  calls.push(typeof input === 'string' ? input : input.url);
+  const body = JSON.stringify(pages.shift());
+  return {{ ok: true, clone() {{ return this; }}, async text() {{ return body; }} }};
+}};
+global.XMLHttpRequest = function() {{}};
+XMLHttpRequest.prototype.open = function() {{}};
+XMLHttpRequest.prototype.setRequestHeader = function() {{}};
+XMLHttpRequest.prototype.send = function() {{}};
+XMLHttpRequest.prototype.addEventListener = function() {{}};
+eval({json.dumps(capture_script)});
+(async () => {{
+  await window.fetch(new Request('https://api-v2.soundcloud.com/stream?offset=0'));
+  await new Promise(setImmediate);
+  window.__omarchyLoadMore('feed');
+  await new Promise(setImmediate); await new Promise(setImmediate);
+  const cycle = window.__omarchyLoadMore('feed');
+  process.stdout.write(JSON.stringify({{ calls, cycle }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+        completed = subprocess.run(
+            ["node", "-e", harness],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        result = json.loads(completed.stdout)
+
+        self.assertEqual(result["calls"], [
+            "https://api-v2.soundcloud.com/stream?offset=0",
+            "https://api-v2.soundcloud.com/stream?offset=10",
+        ])
+        self.assertEqual(result["cycle"], {"started": False, "hasMore": False})
+
     def test_api_observation_script_exposes_only_bounded_resource_paths(self):
         app = load_module()
 
@@ -392,7 +618,7 @@ class BackendCommandTest(unittest.TestCase):
         self.assertNotIn("candidate.href", script)
         self.assertIn("slice(0, 32)", script)
 
-    def test_api_request_capture_does_not_retain_or_replay_frontend_credentials(self):
+    def test_api_request_capture_keeps_frontend_credentials_out_of_page_global_state(self):
         app = load_module()
 
         capture_script = app.api_request_capture_script()
@@ -400,9 +626,16 @@ class BackendCommandTest(unittest.TestCase):
 
         self.assertIn("window.fetch", capture_script)
         self.assertIn("/stream", capture_script)
-        self.assertNotIn("authorization", capture_script.lower())
-        self.assertNotIn("client-id", capture_script.lower())
         self.assertNotIn("__omarchyApiRequests", capture_script)
+        self.assertIn("const pagination = Object.create(null)", capture_script)
+        self.assertIn("const privateHeaders = new Headers()", capture_script)
+        self.assertIn("url.protocol !== 'https:'", capture_script)
+        self.assertIn("url.username || url.password", capture_script)
+        self.assertIn("const context = path ? requestContext(input, init) : null", capture_script)
+        self.assertIn(
+            "JSON.stringify({ source, tracks, reset, hasMore, addedCount })",
+            capture_script,
+        )
         self.assertNotIn("console.", capture_script)
         self.assertNotIn("fetch(", tracks_script)
         self.assertNotIn("performance.getEntriesByType", tracks_script)
@@ -415,7 +648,8 @@ class BackendCommandTest(unittest.TestCase):
         self.assertIn("response.clone().text()", script)
         self.assertIn("addEventListener('load'", script)
         self.assertIn("messageHandlers.omarchyTracks.postMessage", script)
-        self.assertIn("normalise(JSON.parse(text))", script)
+        self.assertIn("const tracks = normalise(payload)", script)
+        self.assertIn("reset", script)
 
     def test_injected_track_scripts_do_not_extract_or_replay_frontend_credentials(self):
         source = MODULE_PATH.read_text()
@@ -710,6 +944,23 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn("runAction(tab)\n    refreshTracks()", qml)
         self.assertIn("message.pending === true", qml)
         self.assertIn('if (message.type === "tracks")', qml)
+
+    def test_track_lists_request_more_before_reaching_the_exact_end(self):
+        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+
+        self.assertNotIn("onContentYChanged: root.loadMoreTracks", qml)
+        self.assertNotIn("onCountChanged: root.loadMoreTracks", qml)
+        self.assertIn("onMovementEnded: root.loadMoreTracks", qml)
+        self.assertIn("userInitiated: userInitiated", qml)
+        self.assertIn("yPosition: yPosition", qml)
+        self.assertIn("heightRatio: heightRatio", qml)
+        self.assertIn('sendCommand("load-more:" + selectedTab', qml)
+
+    def test_lazy_loading_has_bounded_observability_events(self):
+        source = MODULE_PATH.read_text()
+
+        self.assertIn('"lazy-load-request"', source)
+        self.assertIn('"track-page"', source)
 
     def test_coalesced_socket_frames_are_limited_after_complete_lines_are_parsed(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()

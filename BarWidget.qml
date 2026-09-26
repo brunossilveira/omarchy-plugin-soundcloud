@@ -27,6 +27,14 @@ BarWidget {
   property var trackArtworkData: ({})
   property var trackArtworkPending: ({})
   property bool tracksLoading: false
+  property bool homeLoadMorePending: false
+  property bool feedLoadMorePending: false
+  readonly property bool loadMorePending: selectedTab === "home"
+    ? homeLoadMorePending : feedLoadMorePending
+  property bool homeHasMore: true
+  property bool feedHasMore: true
+  property int homeLoadMoreAtCount: 0
+  property int feedLoadMoreAtCount: 0
   property int trackLoadAttempts: 0
   property bool tracksRequestPending: false
   property int nextRequestId: 1
@@ -38,7 +46,7 @@ BarWidget {
   property bool socketProbePending: true
   property bool launchingBackend: false
   property string socketBuffer: ""
-  readonly property int maxSocketFrameChars: 262144
+  readonly property int maxSocketFrameChars: 524288
   property bool hasTrack: title !== ""
   readonly property var activeSocket: socketLoader.item
   readonly property bool backendConnected: !!(activeSocket && activeSocket.connected)
@@ -90,14 +98,69 @@ BarWidget {
     refreshTracks()
   }
 
+  function loadMoreTracks(yPosition, heightRatio, atEnd, userInitiated) {
+    var requestedCount = selectedTab === "home" ? homeLoadMoreAtCount : feedLoadMoreAtCount
+    var hasMore = selectedTab === "home" ? homeHasMore : feedHasMore
+    if (!backendConnected || !running || !loggedIn
+        || !SoundCloudModel.shouldLoadMoreTracks({
+          userInitiated: userInitiated,
+          hasMore: hasMore,
+          atEnd: atEnd,
+          yPosition: yPosition,
+          heightRatio: heightRatio,
+          count: tracks.length,
+          requestedCount: requestedCount,
+          pending: loadMorePending
+        })) return
+    if (selectedTab === "home") {
+      homeLoadMorePending = true
+      homeLoadMoreAtCount = tracks.length
+    } else {
+      feedLoadMorePending = true
+      feedLoadMoreAtCount = tracks.length
+    }
+    if (sendCommand("load-more:" + selectedTab, "load-more:" + selectedTab) === 0) {
+      setLoadMorePending(selectedTab, false)
+    }
+  }
+
+  function setLoadMorePending(sourceTab, pending) {
+    if (sourceTab === "home") homeLoadMorePending = pending
+    else if (sourceTab === "feed") feedLoadMorePending = pending
+  }
+
   function applyTracks(result, sourceTab) {
     var cached = sourceTab === "home" ? homeTracks : feedTracks
     var applied = SoundCloudModel.applyTrackResult(cached, result)
+    var previousContentY = selectedTab === sourceTab && result && result.reset !== true
+      ? SoundCloudModel.contentYAfterTrackUpdate(
+          trackList.contentY, cached.length, applied.tracks.length)
+      : null
     if (!result || result.pending !== true) {
       if (sourceTab === "home") homeTracks = applied.tracks
       else if (sourceTab === "feed") feedTracks = applied.tracks
     }
     if (selectedTab === sourceTab) tracks = applied.tracks
+    if (previousContentY !== null) {
+      Qt.callLater(function() {
+        var maximum = Math.max(trackList.originY,
+          trackList.originY + trackList.contentHeight - trackList.height)
+        trackList.contentY = Math.max(trackList.originY,
+          Math.min(previousContentY, maximum))
+      })
+    }
+    if (result && result.hasMore === false) {
+      if (sourceTab === "home") homeHasMore = false
+      else if (sourceTab === "feed") feedHasMore = false
+    } else if (result && result.reset === true) {
+      if (sourceTab === "home") {
+        homeHasMore = true
+        homeLoadMoreAtCount = 0
+      } else if (sourceTab === "feed") {
+        feedHasMore = true
+        feedLoadMoreAtCount = 0
+      }
+    }
     if (result && result.error) lastError = String(result.error)
     if (selectedTab === sourceTab) tracksLoading = applied.loading
   }
@@ -159,6 +222,8 @@ BarWidget {
     socketBuffer = ""
     pendingRequests = ({})
     tracksRequestPending = false
+    homeLoadMorePending = false
+    feedLoadMorePending = false
     trackArtworkPending = ({})
     tracksLoading = false
     trackLoadAttempts = 0
@@ -260,7 +325,13 @@ BarWidget {
       return
     }
     if (message.type === "tracks") {
-      applyTracks(message, String(message.source || ""))
+      var messageSource = String(message.source || "")
+      setLoadMorePending(messageSource, false)
+      if (message.error && Number(message.addedCount || 0) === 0) {
+        if (messageSource === "home") homeLoadMoreAtCount = 0
+        else if (messageSource === "feed") feedLoadMoreAtCount = 0
+      }
+      applyTracks(message, messageSource)
       if (message.cached !== true) trackLoadAttempts = 50
       return
     }
@@ -279,6 +350,23 @@ BarWidget {
       } else if (popupOpen && selectedTab !== sourceTab) {
         trackLoadAttempts = 0
         trackReloadTimer.restart()
+      }
+    } else if (kind && kind.indexOf("load-more:") === 0) {
+      var requestedSource = kind.substring(10)
+      if (message.started !== true) {
+        setLoadMorePending(requestedSource, false)
+        if (requestedSource === "home") homeLoadMoreAtCount = 0
+        else if (requestedSource === "feed") feedLoadMoreAtCount = 0
+      }
+      if (message.hasMore === false) {
+        var exhaustedSource = requestedSource
+        if (exhaustedSource === "home") homeHasMore = false
+        else if (exhaustedSource === "feed") feedHasMore = false
+      }
+      if (message.ok !== true) {
+        var loadMoreSource = kind.substring(10)
+        if (loadMoreSource === "home") homeLoadMoreAtCount = 0
+        else if (loadMoreSource === "feed") feedLoadMoreAtCount = 0
       }
     } else if (kind && kind.indexOf("artwork:") === 0) {
       var artworkId = kind.substring(8)
@@ -589,6 +677,23 @@ BarWidget {
           spacing: Style.space(3)
           boundsBehavior: Flickable.StopAtBounds
           model: root.tracks
+          onMovementEnded: root.loadMoreTracks(
+            visibleArea.yPosition, visibleArea.heightRatio, atYEnd, true)
+
+          footer: Item {
+            width: trackList.width
+            height: root.loadMorePending ? Style.space(28) : 0
+
+            Text {
+              anchors.centerIn: parent
+              visible: root.loadMorePending
+              textFormat: Text.PlainText
+              text: "Loading more…"
+              color: root.dim
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
 
           delegate: Item {
             required property var modelData

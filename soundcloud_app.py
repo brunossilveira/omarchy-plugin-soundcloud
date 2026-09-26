@@ -39,12 +39,12 @@ APP_ID = "com.github.brunosilveira.OmarchySoundCloud"
 APP_NAME = "SoundCloud"
 START_URI = "https://soundcloud.com/you/likes"
 MAX_REQUEST_BYTES = 4096
-MAX_RESPONSE_BYTES = 262144
+MAX_RESPONSE_BYTES = 524288
 MAX_TITLE_BYTES = 512
 MAX_ARTIST_BYTES = 256
 MAX_URL_BYTES = 2048
 MAX_ERROR_BYTES = 512
-MAX_TRACKS = 50
+MAX_TRACKS = 100
 MAX_PLAY_COUNT = 10**12
 MAX_TRACK_DURATION_MS = 7 * 24 * 60 * 60 * 1000
 MAX_ARTWORK_BYTES = 131072
@@ -53,10 +53,11 @@ LIST_ARTWORK_BYTES = 32768
 LIST_ARTWORK_PIXELS = 512 * 512
 LIST_ARTWORK_DIMENSION = 512
 MAX_COOKIE_STORE_BYTES = 512 * 1024
-MAX_TRACK_CACHE_BYTES = 512 * 1024
+MAX_TRACK_CACHE_BYTES = 1024 * 1024
 MAX_COOKIES = 256
 MAX_CLIENTS = 8
 MAX_PENDING_DISPATCHES = 32
+MAX_EVENT_LOG_BYTES = 512 * 1024
 CLIENT_TIMEOUT_SECONDS = 5.0
 CLIENT_IDLE_SECONDS = 60.0
 SEND_TIMEOUT_SECONDS = 0.1
@@ -67,6 +68,8 @@ SOUNDCLOUD_WEB_HOSTS = {
     "secure.soundcloud.com",
     "m.soundcloud.com",
 }
+_event_log_fd: int | None = None
+_event_log_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -99,6 +102,91 @@ def runtime_socket_path(env: Mapping[str, str] | None = None) -> Path:
     if not root.is_absolute():
         raise RuntimeError("XDG_RUNTIME_DIR must be absolute")
     return root / "omarchy-soundcloud" / "control.sock"
+
+
+def log_event(event: str, **fields: object) -> None:
+    """Write bounded, credential-free pagination diagnostics."""
+    allowed_fields = {
+        "track-page": {
+            "source", "reset", "incomingCount", "previousCount",
+            "resultCount", "addedCount", "hasMore",
+        },
+        "lazy-load-request": {"source", "started", "hasMore"},
+    }
+    if _event_log_fd is None or event not in allowed_fields:
+        return
+    record = {"event": event, "time": round(time.time(), 3)}
+    record.update({key: value for key, value in fields.items() if key in allowed_fields[event]})
+    encoded = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if len(encoded) > 2048:
+        return
+    with _event_log_lock:
+        try:
+            details = os.fstat(_event_log_fd)
+            if details.st_size + len(encoded) > MAX_EVENT_LOG_BYTES:
+                os.ftruncate(_event_log_fd, 0)
+            os.write(_event_log_fd, encoded)
+        except OSError:
+            pass
+
+
+def configure_runtime_event_log() -> None:
+    global _event_log_fd
+    raw_fd = os.environ.pop("OMARCHY_SOUNDCLOUD_EVENT_LOG_FD", "")
+    if not raw_fd.isdecimal():
+        return
+    fd = int(raw_fd)
+    try:
+        details = os.fstat(fd)
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.geteuid()
+            or details.st_nlink != 1
+            or details.st_mode & 0o077
+        ):
+            raise PermissionError("refusing unsafe pagination log")
+        os.set_inheritable(fd, False)
+        _event_log_fd = fd
+    except (OSError, ValueError):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def close_runtime_event_log() -> None:
+    global _event_log_fd
+    if _event_log_fd is None:
+        return
+    try:
+        os.close(_event_log_fd)
+    except OSError:
+        pass
+    _event_log_fd = None
+
+
+def open_runtime_event_log():
+    directory_fd = ensure_private_directory(runtime_socket_path().parent)
+    try:
+        fd = os.open(
+            "pagination.log",
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=directory_fd,
+        )
+    finally:
+        os.close(directory_fd)
+    try:
+        details = os.fstat(fd)
+        if not stat.S_ISREG(details.st_mode) or details.st_uid != os.geteuid() or details.st_nlink != 1:
+            raise PermissionError("refusing unsafe pagination log")
+        os.fchmod(fd, 0o600)
+        if details.st_size > MAX_EVENT_LOG_BYTES:
+            os.ftruncate(fd, 0)
+        return os.fdopen(fd, "a", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def ensure_private_directory(path: Path) -> int:
@@ -500,6 +588,44 @@ def track_source_from_command(command: str) -> str | None:
     }.get(command)
 
 
+def load_more_source_from_command(command: str) -> str | None:
+    return {
+        "load-more:home": "home",
+        "load-more:feed": "feed",
+    }.get(command)
+
+
+def merge_track_pages(
+    existing: list[dict[str, object]],
+    incoming: list[dict[str, object]],
+    *,
+    reset: bool,
+    limit: int = MAX_TRACKS,
+) -> list[dict[str, object]]:
+    merged: OrderedDict[str, dict[str, object]] = OrderedDict()
+    if not reset:
+        for track in existing:
+            url = track.get("url") if isinstance(track, dict) else None
+            if isinstance(url, str) and url:
+                merged[url] = track
+    for track in incoming:
+        url = track.get("url") if isinstance(track, dict) else None
+        if isinstance(url, str) and url:
+            merged[url] = track
+    return list(merged.values())[:max(0, limit)]
+
+
+def load_more_script(source: str) -> str | None:
+    if source not in {"home", "feed"}:
+        return None
+    return rf"""(() => {{
+      if (typeof window.__omarchyLoadMore !== 'function') {{
+        return {{ started: false, hasMore: false }};
+      }}
+      return window.__omarchyLoadMore({json.dumps(source)});
+    }})()"""
+
+
 def api_tracks_script(source: str) -> str | None:
     if source not in {"home", "feed"}:
         return None
@@ -511,7 +637,7 @@ def api_tracks_script(source: str) -> str | None:
       if (!state || typeof state !== 'object') {{
         return {{ tracks: [], pending: true, error: '' }};
       }}
-      const tracks = Array.isArray(state.tracks) ? state.tracks.slice(0, 50) : [];
+      const tracks = Array.isArray(state.tracks) ? state.tracks.slice(0, 100) : [];
       return {{
         tracks,
         pending: state.loading === true || state.completed !== true,
@@ -525,6 +651,9 @@ def api_request_capture_script() -> str:
       const allowedPaths = new Set(['/stream', '/mixed-selections']);
       const cache = window.__omarchyApiTrackLists || Object.create(null);
       window.__omarchyApiTrackLists = cache;
+      const publishedSources = new Set();
+      const pagination = Object.create(null);
+      const xhrRequests = new WeakMap();
       const normalise = (payload) => {
         const queue = [[payload, 0]];
         const seenObjects = new Set();
@@ -562,22 +691,117 @@ def api_request_capture_script() -> str:
         }
         return tracks;
       };
-      const publish = (path, text) => {
+      const validNextUrl = (payload, path) => {
         try {
-          if (!(text.length > 0 && text.length <= 2 * 1024 * 1024)) return;
-          const tracks = normalise(JSON.parse(text));
+          const value = payload && typeof payload.next_href === 'string' ? payload.next_href : '';
+          if (!value || value.length > 4096) return '';
+          const url = new URL(value);
+          if (url.protocol !== 'https:'
+              || url.hostname !== 'api-v2.soundcloud.com'
+              || (url.port && url.port !== '443')
+              || url.username || url.password
+              || url.pathname !== path) return '';
+          return url.href;
+        } catch (_) { return ''; }
+      };
+      const requestContext = (input, init) => {
+        const request = input instanceof Request ? input : null;
+        const headers = new Headers(request ? request.headers : undefined);
+        if (init && init.headers) {
+          for (const [name, value] of new Headers(init.headers)) headers.set(name, value);
+        }
+        const privateHeaders = new Headers();
+        for (const name of ['authorization', 'x-client-id', 'x-soundcloud-client-id']) {
+          const value = headers.get(name);
+          if (value && value.length <= 2048) privateHeaders.set(name, value);
+        }
+        return {
+          headers: privateHeaders,
+          credentials: String((init && init.credentials) || (request && request.credentials) || 'omit'),
+          requestUrl: new URL(request ? request.url : input, location.href).href
+        };
+      };
+      const finishWithoutPage = (source, error, requestUrl) => {
+        const state = pagination[source];
+        if (state) {
+          state.loading = false;
+          if (requestUrl && state.seen instanceof Set) state.seen.delete(requestUrl);
+          if (state.lastRequested === requestUrl) state.lastRequested = '';
+        }
+        const current = cache[source];
+        if (current) {
+          current.loading = false;
+          current.completed = true;
+          current.error = String(error || '').slice(0, 128);
+        }
+        window.webkit.messageHandlers.omarchyTracks.postMessage(JSON.stringify({
+          source,
+          tracks: [],
+          reset: false,
+          hasMore: true,
+          addedCount: 0,
+          error: String(error || 'Could not load more tracks').slice(0, 128)
+        }));
+      };
+      const publish = (path, text, context) => {
+        try {
+          if (!(text.length > 0 && text.length <= 2 * 1024 * 1024)) throw new Error('invalid response');
+          const payload = JSON.parse(text);
+          const tracks = normalise(payload);
           const source = path === '/stream' ? 'feed' : 'home';
-          cache[source] = { tracks, loading: false, completed: true, error: '' };
+          const reset = !publishedSources.has(source);
+          publishedSources.add(source);
+          const previous = !reset && cache[source] && Array.isArray(cache[source].tracks)
+            ? cache[source].tracks : [];
+          const merged = new Map(previous.map((track) => [track.url, track]));
+          for (const track of tracks) merged.set(track.url, track);
+          const visibleTracks = Array.from(merged.values()).slice(0, 100);
+          const addedCount = reset ? visibleTracks.length
+            : Math.max(0, visibleTracks.length - previous.length);
+          const candidateNext = validNextUrl(payload, path);
+          const seen = context.seen instanceof Set ? context.seen : new Set();
+          if (context.requestUrl) seen.add(context.requestUrl);
+          const hasMore = visibleTracks.length < 100
+            && (reset || addedCount > 0)
+            && !!candidateNext
+            && !seen.has(candidateNext);
+          pagination[source] = {
+            next: hasMore ? candidateNext : '',
+            path,
+            headers: context.headers,
+            credentials: context.credentials,
+            loading: false,
+            lastRequested: String(context.requestUrl || ''),
+            seen
+          };
+          cache[source] = {
+            tracks: visibleTracks,
+            loading: false,
+            completed: true,
+            error: ''
+          };
           window.webkit.messageHandlers.omarchyTracks.postMessage(
-            JSON.stringify({ source, tracks })
+            JSON.stringify({ source, tracks, reset, hasMore, addedCount })
           );
-        } catch (_) {}
+        } catch (_) {
+          if (context.requestUrl) {
+            finishWithoutPage(
+              path === '/stream' ? 'feed' : 'home',
+              'Could not load more tracks',
+              context.requestUrl
+            );
+          }
+        }
       };
       const routeFor = (input) => {
         try {
           const request = input instanceof Request ? input : null;
           const url = new URL(request ? request.url : input, location.href);
-          if (url.hostname !== 'api-v2.soundcloud.com' || !allowedPaths.has(url.pathname)) return '';
+          if (url.protocol !== 'https:'
+              || url.hostname !== 'api-v2.soundcloud.com'
+              || (url.port && url.port !== '443')
+              || url.username || url.password
+              || !allowedPaths.has(url.pathname)) return '';
           return url.pathname;
         } catch (_) { return ''; }
       };
@@ -586,7 +810,7 @@ def api_request_capture_script() -> str:
         const source = path === '/stream' ? 'feed' : 'home';
         const previous = cache[source];
         cache[source] = {
-          tracks: previous && Array.isArray(previous.tracks) ? previous.tracks.slice(0, 50) : [],
+          tracks: previous && Array.isArray(previous.tracks) ? previous.tracks.slice(0, 100) : [],
           loading: true,
           completed: false,
           error: ''
@@ -595,25 +819,105 @@ def api_request_capture_script() -> str:
       const originalFetch = window.fetch.bind(window);
       window.fetch = function(input, init) {
         const path = routeFor(input);
+        const context = path ? requestContext(input, init) : null;
         markLoading(path);
         return originalFetch(input, init).then((response) => {
-          if (path) response.clone().text().then((text) => publish(path, text)).catch(() => {});
+          if (path && response.ok) {
+            response.clone().text()
+              .then((text) => publish(path, text, context))
+              .catch(() => {
+                const current = cache[path === '/stream' ? 'feed' : 'home'];
+                if (current) current.loading = false;
+              });
+          } else if (path) {
+            const current = cache[path === '/stream' ? 'feed' : 'home'];
+            if (current) current.loading = false;
+          }
           return response;
+        }).catch((error) => {
+          if (path) {
+            const current = cache[path === '/stream' ? 'feed' : 'home'];
+            if (current) current.loading = false;
+          }
+          throw error;
         });
       };
       const originalOpen = XMLHttpRequest.prototype.open;
+      const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
       const originalSend = XMLHttpRequest.prototype.send;
       XMLHttpRequest.prototype.open = function(method, url) {
-        this.__omarchyApiPath = routeFor(url);
+        const path = routeFor(url);
+        xhrRequests.set(this, {
+          path,
+          headers: new Headers(),
+          credentials: 'include',
+          requestUrl: path ? new URL(url, location.href).href : ''
+        });
         return originalOpen.apply(this, arguments);
       };
+      XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+        const context = xhrRequests.get(this);
+        if (context && context.path
+            && /^(authorization|x-client-id|x-soundcloud-client-id)$/i.test(String(name))) {
+          const bounded = String(value);
+          if (bounded.length <= 2048) context.headers.set(String(name), bounded);
+        }
+        return originalSetRequestHeader.apply(this, arguments);
+      };
       XMLHttpRequest.prototype.send = function() {
-        const path = this.__omarchyApiPath || '';
+        const context = xhrRequests.get(this) || { path: '', headers: new Headers(), credentials: 'omit' };
+        const path = context.path;
         markLoading(path);
         if (path) this.addEventListener('load', function() {
-          if (!this.responseType || this.responseType === 'text') publish(path, String(this.responseText || ''));
+          if (this.status >= 200 && this.status < 300
+              && (!this.responseType || this.responseType === 'text')) {
+            publish(path, String(this.responseText || ''), context);
+          } else {
+            const current = cache[path === '/stream' ? 'feed' : 'home'];
+            if (current) current.loading = false;
+          }
         }, { once: true });
+        for (const eventName of ['error', 'abort', 'timeout']) {
+          if (path) this.addEventListener(eventName, function() {
+            const current = cache[path === '/stream' ? 'feed' : 'home'];
+            if (current) current.loading = false;
+          }, { once: true });
+        }
         return originalSend.apply(this, arguments);
+      };
+      window.__omarchyLoadMore = function(source) {
+        const expectedPath = source === 'feed' ? '/stream'
+          : (source === 'home' ? '/mixed-selections' : '');
+        const state = pagination[source];
+        if (!expectedPath || !state || state.path !== expectedPath || !state.next) {
+          return { started: false, hasMore: false };
+        }
+        if (state.loading) return { started: false, hasMore: true };
+        const requestUrl = state.next;
+        const seen = state.seen instanceof Set ? state.seen : new Set();
+        if (seen.has(requestUrl) || seen.size >= 128) {
+          state.next = '';
+          return { started: false, hasMore: false };
+        }
+        seen.add(requestUrl);
+        state.seen = seen;
+        state.loading = true;
+        state.lastRequested = requestUrl;
+        markLoading(expectedPath);
+        originalFetch(requestUrl, {
+          method: 'GET',
+          headers: state.headers,
+          credentials: state.credentials
+        }).then((response) => {
+          if (!response.ok) throw new Error('HTTP ' + response.status);
+          return response.text();
+        }).then((text) => publish(expectedPath, text, {
+          headers: state.headers,
+          credentials: state.credentials,
+          requestUrl,
+          seen
+        })).catch(() => finishWithoutPage(source, 'Could not load more tracks', requestUrl));
+        return { started: true, hasMore: true };
       };
     })()"""
 
@@ -1640,19 +1944,53 @@ def build_application(show_on_start: bool = False):
                 source = payload.get("source") if isinstance(payload, dict) else None
                 if source not in {"home", "feed"}:
                     return
-                result = self._secure_tracks({"tracks": payload.get("tracks")})
+                page = validate_tracks_payload({"tracks": payload.get("tracks")})
+                if page is None:
+                    return
+                incoming_tracks = page.get("tracks")
+                if not isinstance(incoming_tracks, list):
+                    return
+                existing_tracks = self.track_cache.get(source, [])
+                reset = payload.get("reset") is True
+                merged_tracks = merge_track_pages(
+                    existing_tracks,
+                    incoming_tracks,
+                    reset=reset,
+                )
+                previous_count = 0 if reset else len(existing_tracks)
+                added_count = max(0, len(merged_tracks) - previous_count)
+                pagination_error = _bounded_string(payload.get("error", ""), 128) or ""
+                has_more = payload.get("hasMore") is True and (
+                    added_count > 0 or bool(pagination_error)
+                )
+                result = self._secure_tracks({"tracks": merged_tracks})
                 if result is None:
                     return
             except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
                 return
             self.status_subscribers.publish_message(
-                {"type": "tracks", "source": source, **result}
+                {
+                    "type": "tracks",
+                    "source": source,
+                    "reset": reset,
+                    "hasMore": has_more,
+                    "addedCount": added_count,
+                    **({"error": pagination_error} if pagination_error else {}),
+                    **result,
+                }
+            )
+            log_event(
+                "track-page",
+                source=source,
+                reset=reset,
+                incomingCount=len(incoming_tracks),
+                previousCount=previous_count,
+                resultCount=len(merged_tracks),
+                addedCount=added_count,
+                hasMore=has_more,
             )
             if result["tracks"]:
-                sanitized_tracks = sanitize_track_cache({source: payload["tracks"]}).get(source)
-                if not sanitized_tracks:
-                    return
-                self.track_cache[source] = sanitized_tracks
+                self.track_cache[source] = merged_tracks
                 if not self.track_cache_save_pending:
                     self.track_cache_save_pending = True
                     GLib.idle_add(self._save_track_cache)
@@ -1863,6 +2201,32 @@ def build_application(show_on_start: bool = False):
                 self.disconnect_generation += 1
                 self._respond(connection, request_id, {"ok": True, "running": True})
                 GLib.idle_add(self._publish_status_once)
+            elif (source := load_more_source_from_command(command)) is not None:
+                def load_more_finished(payload):
+                    valid = isinstance(payload, dict)
+                    started = valid and payload.get("started") is True
+                    has_more = valid and payload.get("hasMore") is True
+                    log_event(
+                        "lazy-load-request",
+                        source=source,
+                        started=started,
+                        hasMore=has_more,
+                    )
+                    self._respond(
+                        connection,
+                        request_id,
+                        {
+                            "ok": valid,
+                            "running": True,
+                            "started": started,
+                            "hasMore": has_more,
+                        },
+                    )
+
+                self._evaluate(
+                    load_more_script(source),
+                    load_more_finished,
+                )
             elif (source := track_source_from_command(command)) is not None:
                 def tracks_finished(payload):
                     pending = isinstance(payload, dict) and payload.get("pending") is True
@@ -2075,14 +2439,21 @@ def launch_backend(show: bool) -> dict[str, object]:
         }
     }
     allowed_environment["PATH"] = "/usr/bin:/bin"
-    subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        env=allowed_environment,
-    )
+    event_log = open_runtime_event_log()
+    try:
+        event_log_fd = event_log.fileno()
+        allowed_environment["OMARCHY_SOUNDCLOUD_EVENT_LOG_FD"] = str(event_log_fd)
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            pass_fds=(event_log_fd,),
+            start_new_session=True,
+            env=allowed_environment,
+        )
+    finally:
+        event_log.close()
     return {"ok": True, "starting": True, "running": True}
 
 
@@ -2127,13 +2498,17 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(response, sort_keys=True))
         return 0 if response.get("ok") or command == "status" else 1
 
-    apply_graphics_workarounds()
-    check = dependency_check()
-    if not check["ok"]:
-        print(check.get("error", "GTK/WebKit dependencies are missing"), file=sys.stderr)
-        return 1
-    app = build_application(show_on_start=bool(args.show))
-    return app.run([sys.argv[0]])
+    configure_runtime_event_log()
+    try:
+        apply_graphics_workarounds()
+        check = dependency_check()
+        if not check["ok"]:
+            print(check.get("error", "GTK/WebKit dependencies are missing"), file=sys.stderr)
+            return 1
+        app = build_application(show_on_start=bool(args.show))
+        return app.run([sys.argv[0]])
+    finally:
+        close_runtime_event_log()
 
 
 if __name__ == "__main__":

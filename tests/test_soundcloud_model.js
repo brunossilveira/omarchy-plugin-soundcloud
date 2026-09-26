@@ -39,4 +39,60 @@ const completedFeed = model.applyTrackResult(pendingFeed.tracks, {
 assert.deepEqual(completedFeed.tracks, refreshedFeed);
 assert.equal(completedFeed.loading, false);
 
+assert.equal(model.shouldLoadMoreTracks({
+  userInitiated: true, atEnd: true, count: 20, requestedCount: 0, pending: false,
+}), true);
+assert.equal(model.shouldLoadMoreTracks({
+  userInitiated: true, atEnd: true, count: 20, requestedCount: 20, pending: false,
+}), false);
+assert.equal(model.shouldLoadMoreTracks({
+  userInitiated: true, atEnd: true, count: 20, requestedCount: 0, pending: true,
+}), false);
+assert.equal(model.shouldLoadMoreTracks({
+  userInitiated: true, atEnd: false, count: 20, requestedCount: 0, pending: false,
+}), false);
+
+// Regression: Qt may not report atYEnd even when the user has visibly reached
+// the bottom area. Loading must begin from the visible-area ratio instead.
+assert.equal(model.shouldLoadMoreTracks({
+  userInitiated: true, atEnd: false, yPosition: 0.76, heightRatio: 0.10,
+  count: 20, requestedCount: 0, pending: false,
+}), true);
+assert.equal(model.shouldLoadMoreTracks({
+  userInitiated: true, atEnd: false, yPosition: 0.74, heightRatio: 0.10,
+  count: 20, requestedCount: 0, pending: false,
+}), false);
+
+// Regression: appending a page changes the model and scroll geometry. That
+// automatic update must not immediately request another page in a loop.
+assert.equal(model.shouldLoadMoreTracks({
+  userInitiated: false, atEnd: true, yPosition: 0.90, heightRatio: 0.10,
+  count: 21, requestedCount: 11, pending: false,
+}), false);
+
+assert.equal(model.contentYAfterTrackUpdate(240, 11, 21), 240);
+assert.equal(model.contentYAfterTrackUpdate(240, 21, 21), null);
+
+var requestEvents = [];
+function observeListEvent(reason, count, hasMore) {
+  if (model.shouldLoadMoreTracks({
+    userInitiated: reason === "movement-ended",
+    hasMore: hasMore,
+    atEnd: false,
+    yPosition: 0.86,
+    heightRatio: 0.1,
+    count: count,
+    requestedCount: requestEvents.length ? 11 : 0,
+    pending: false
+  })) requestEvents.push({ reason: reason, count: count });
+}
+
+observeListEvent("movement-ended", 11, true);
+observeListEvent("page-appended", 21, true);
+assert.deepEqual(requestEvents, [{ reason: "movement-ended", count: 11 }]);
+observeListEvent("movement-ended", 21, true);
+assert.equal(requestEvents.length, 2);
+observeListEvent("movement-ended", 31, false);
+assert.equal(requestEvents.length, 2);
+
 console.log("SoundCloudModel tests passed");
