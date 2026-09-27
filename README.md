@@ -17,30 +17,6 @@ without official SoundCloud API credentials.
 - Persistent SoundCloud login session
 - Local audio playback through GStreamer
 
-## How it works
-
-A hidden, sandboxed WebKitGTK view stays signed in to soundcloud.com. The backend
-reads the SoundCloud web app's own API responses to build the Home and Feed lists
-and to resolve stream URLs, then plays the audio locally with GStreamer. The bar
-widget talks to the backend over a private Unix socket.
-
-- The backend (`soundcloud_app.py`) starts only when you interact with the widget.
-  When the shell starts, the widget only looks for a running backend, so playback
-  survives shell restarts.
-- The backend stops when the plugin is removed, or 10 seconds after the bar widget
-  disconnects.
-- Home and Feed are built from the SoundCloud page's own API responses and
-  paginated through SoundCloud's API cursors. Each list keeps at most 100 tracks
-  and is cached so the popup has content right after a restart.
-- Selecting a track resolves it to a short-lived stream URL inside the WebKit view.
-  The backend then plays it with GStreamer, directly for progressive streams and
-  through a bounded segment fetcher for HLS. A track that does not resolve within
-  15 seconds shows an error.
-- Play/pause and seek control GStreamer when it is playing. Otherwise they, and
-  previous/next, control SoundCloud's own web player.
-- On Hyprland the backend sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` to avoid
-  WebKitGTK rendering crashes.
-
 ## Requirements
 
 - Omarchy 4 with `omarchy-shell`
@@ -74,16 +50,6 @@ from a keybinding or script with:
 omarchy-shell shell toggle brunosilveira.soundcloud
 ```
 
-## Install for development
-
-```sh
-ln -s "$PWD" ~/.config/omarchy/plugins/brunosilveira.soundcloud
-omarchy-shell shell rescanPlugins
-omarchy plugin enable brunosilveira.soundcloud --before omarchy.tray
-```
-
-The widget appears in the right section of the top bar, immediately before the system tray.
-
 ## First sign-in
 
 1. Click the SoundCloud icon in the top bar.
@@ -102,43 +68,6 @@ keeps running.
 - Mouse wheel: previous/next
 - Popup: artwork, metadata, playback controls, and a seekable waveform
 - Home and Feed tabs: click a track to play it
-
-## Privacy and security
-
-- Network endpoints: the hidden WebKit view loads the `soundcloud.com` web app,
-  which makes its own `api-v2.soundcloud.com` calls and loads whatever
-  subresources (scripts, images, analytics) SoundCloud's page includes. Top-level
-  navigation is limited to `soundcloud.com` hosts. The Python backend itself
-  fetches audio only from `*.sndcdn.com` and `*.soundcloud.cloud` and artwork only
-  from `i1.sndcdn.com`, over HTTPS.
-- WebKit uses an ephemeral in-memory profile and cache; it is never given a
-  pathname to reopen for session storage.
-- The session survives restarts through a bounded, owner-only cookie jar in
-  `~/.local/share/omarchy-soundcloud/`. The account password is never stored.
-- SoundCloud's request authorization headers stay inside the WebKit view. They
-  are never passed to the backend, logged, or written to disk.
-- Artwork is downloaded only from SoundCloud's `i1.sndcdn.com` CDN through a
-  bounded HTTPS fetcher, validated as PNG or JPEG, and passed to the shell as
-  bounded image data.
-- The bar connects to the backend over a mode-0600 Unix socket in the owner-only
-  `$XDG_RUNTIME_DIR/omarchy-soundcloud/` directory. The backend checks each
-  client's Unix peer credentials. Status is pushed over that connection, so normal
-  controls do not launch a new Python process.
-
-## Backend CLI
-
-```sh
-python3 soundcloud_app.py check        # check runtime dependencies (JSON)
-python3 soundcloud_app.py launch       # start the backend and show the sign-in window
-python3 soundcloud_app.py status
-python3 soundcloud_app.py play-pause
-python3 soundcloud_app.py previous
-python3 soundcloud_app.py next
-python3 soundcloud_app.py seek 0.5     # seek to 50%
-python3 soundcloud_app.py play soundcloud:tracks:123456
-python3 soundcloud_app.py show         # show the SoundCloud window
-python3 soundcloud_app.py stop
-```
 
 ## Troubleshooting
 
@@ -178,6 +107,84 @@ rm -r -- ~/.local/share/omarchy-soundcloud ~/.cache/omarchy-soundcloud
 omarchy plugin remove brunosilveira.soundcloud
 ```
 
+## Limitations
+
+SoundCloud requires Artist Pro to issue official API credentials, so this plugin uses
+the authenticated web app's private JSON APIs through an isolated WebKit view.
+Selecting a track resolves its stable track ID to a short-lived media URL for the
+local GStreamer player. These private API schemas can change without notice.
+
+## How it works
+
+A hidden, sandboxed WebKitGTK view stays signed in to soundcloud.com. The backend
+reads the SoundCloud web app's own API responses to build the Home and Feed lists
+and to resolve stream URLs, then plays the audio locally with GStreamer. The bar
+widget talks to the backend over a private Unix socket.
+
+- The backend (`soundcloud_app.py`) starts only when you interact with the widget.
+  When the shell starts, the widget only looks for a running backend, so playback
+  survives shell restarts.
+- The backend stops when the plugin is removed, or 10 seconds after the bar widget
+  disconnects.
+- Home and Feed are built from the SoundCloud page's own API responses and
+  paginated through SoundCloud's API cursors. Each list keeps at most 100 tracks
+  and is cached so the popup has content right after a restart.
+- Selecting a track resolves it to a short-lived stream URL inside the WebKit view.
+  The backend then plays it with GStreamer, directly for progressive streams and
+  through a bounded segment fetcher for HLS. A track that does not resolve within
+  15 seconds shows an error.
+- Play/pause and seek control GStreamer when it is playing. Otherwise they, and
+  previous/next, control SoundCloud's own web player.
+- On Hyprland the backend sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` to avoid
+  WebKitGTK rendering crashes.
+
+## Privacy and security
+
+- Network endpoints: the hidden WebKit view loads the `soundcloud.com` web app,
+  which makes its own `api-v2.soundcloud.com` calls and loads whatever
+  subresources (scripts, images, analytics) SoundCloud's page includes. Top-level
+  navigation is limited to `soundcloud.com` hosts. The Python backend itself
+  fetches audio only from `*.sndcdn.com` and `*.soundcloud.cloud` and artwork only
+  from `i1.sndcdn.com`, over HTTPS.
+- WebKit uses an ephemeral in-memory profile and cache; it is never given a
+  pathname to reopen for session storage.
+- The session survives restarts through a bounded, owner-only cookie jar in
+  `~/.local/share/omarchy-soundcloud/`. The account password is never stored.
+- SoundCloud's request authorization headers stay inside the WebKit view. They
+  are never passed to the backend, logged, or written to disk.
+- Artwork is downloaded only from SoundCloud's `i1.sndcdn.com` CDN through a
+  bounded HTTPS fetcher, validated as PNG or JPEG, and passed to the shell as
+  bounded image data.
+- The bar connects to the backend over a mode-0600 Unix socket in the owner-only
+  `$XDG_RUNTIME_DIR/omarchy-soundcloud/` directory. The backend checks each
+  client's Unix peer credentials. Status is pushed over that connection, so normal
+  controls do not launch a new Python process.
+
+## Backend CLI
+
+```sh
+python3 soundcloud_app.py check        # check runtime dependencies (JSON)
+python3 soundcloud_app.py launch       # start the backend and show the sign-in window
+python3 soundcloud_app.py status
+python3 soundcloud_app.py play-pause
+python3 soundcloud_app.py previous
+python3 soundcloud_app.py next
+python3 soundcloud_app.py seek 0.5     # seek to 50%
+python3 soundcloud_app.py play soundcloud:tracks:123456
+python3 soundcloud_app.py show         # show the SoundCloud window
+python3 soundcloud_app.py stop
+```
+
+## Install for development
+
+```sh
+ln -s "$PWD" ~/.config/omarchy/plugins/brunosilveira.soundcloud
+omarchy-shell shell rescanPlugins
+omarchy plugin enable brunosilveira.soundcloud --before omarchy.tray
+```
+
+The widget appears in the right section of the top bar, immediately before the system tray.
+
 ## Development
 
 ```sh
@@ -192,13 +199,6 @@ need GTK or a display.
 - QML changes take effect after `omarchy-restart-shell`.
 - Python changes take effect after `python3 soundcloud_app.py stop` and relaunching
   the backend from the bar.
-
-## Limitations
-
-SoundCloud requires Artist Pro to issue official API credentials, so this plugin uses
-the authenticated web app's private JSON APIs through an isolated WebKit view.
-Selecting a track resolves its stable track ID to a short-lived media URL for the
-local GStreamer player. These private API schemas can change without notice.
 
 ## License
 
