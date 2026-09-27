@@ -299,7 +299,7 @@ BarWidget {
     var details = [String(track.artist || "SoundCloud")]
     var playCount = Math.max(0, Math.floor(Number(track.playCount) || 0))
     var durationMs = Math.max(0, Math.floor(Number(track.durationMs) || 0))
-    details.push(playCount > 0 ? "▶ " + formatCompactCount(playCount) : "▶ —")
+    if (playCount > 0) details.push("▶ " + formatCompactCount(playCount))
     details.push(durationMs > 0 ? formatTime(durationMs / 1000) : "—:—")
     return details.join("  •  ")
   }
