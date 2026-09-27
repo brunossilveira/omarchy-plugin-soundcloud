@@ -3,6 +3,11 @@
 SoundCloud playback and browsing in the Omarchy top bar, without a browser tab and
 without official SoundCloud API credentials.
 
+<p>
+  <img src="screenshots/home.png" alt="SoundCloud popup showing the Home tab" width="360">
+  <img src="screenshots/feed.png" alt="SoundCloud popup showing the Feed tab" width="360">
+</p>
+
 ## Features
 
 - Current track, artist, and artwork, with the bar icon highlighted during playback
