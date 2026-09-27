@@ -1,32 +1,39 @@
 # Omarchy SoundCloud
 
-A dedicated SoundCloud widget for the Omarchy top bar. It keeps the normal UI in the bar rather than in a browser tab.
+SoundCloud playback and browsing in the Omarchy top bar, without a browser tab and
+without official SoundCloud API credentials.
 
 ## Features
 
-- Current track, artist, and artwork
+- Current track, artist, and artwork, with the bar icon highlighted during playback
 - Play/pause, previous, and next controls
 - SoundCloud-style waveform progress display with click-to-seek
-- Scrollable Home and Feed tabs for choosing tracks
+- Home and Feed tabs that load more tracks as you scroll
 - Persistent SoundCloud login session
-- Hidden WebKitGTK playback backend after sign-in
-- No Chromium tab and no SoundCloud API credentials
+- Local audio playback through GStreamer
+
+## How it works
+
+A hidden, sandboxed WebKitGTK view stays signed in to soundcloud.com. The backend
+reads the SoundCloud web app's own API responses to build the Home and Feed lists
+and to resolve stream URLs, then plays the audio locally with GStreamer. The bar
+widget talks to the backend over a private Unix socket.
 
 ## Requirements
 
 - Omarchy 4 with `omarchy-shell`
 - Python 3 with PyGObject
-- GTK 3 and WebKitGTK 4.1
+- GTK 3, WebKitGTK 4.1, and libsoup 3
 - `gst-plugins-good` (provides WebKitGTK's required `autoaudiosink`)
 - `gst-libav` (provides AAC decoding for current SoundCloud HLS streams)
 
-Install the GStreamer plugin package if needed:
+Install the GStreamer plugins if needed:
 
 ```sh
 omarchy pkg add gst-plugins-good gst-libav
 ```
 
-Verify all runtime dependencies with:
+Verify all runtime dependencies:
 
 ```sh
 python3 soundcloud_app.py check
@@ -44,56 +51,65 @@ The widget appears in the right section of the top bar, immediately before the s
 
 ## First sign-in
 
-1. Click the SoundCloud icon in the top-right bar.
+1. Click the SoundCloud icon in the top bar.
 2. Select `Sign in to SoundCloud`.
-3. Sign in inside the one-time SoundCloud window.
+3. Sign in inside the SoundCloud window.
 4. Close the window after the account page loads.
 
-Closing that window hides it; it does not close the playback backend. A bounded,
-owner-only cookie jar is stored locally under:
-
-```text
-~/.local/share/omarchy-soundcloud/
-```
-
-WebKit itself uses an ephemeral in-memory profile and cache; it is never given a
-pathname to reopen for session storage. The plugin does not store the account
-password. SoundCloud session cookies remain local in the descriptor-anchored
-data directory. Artwork is
-downloaded only from SoundCloud's `i1.sndcdn.com` CDN through a bounded HTTPS
-fetcher, validated as PNG or JPEG, and passed to the shell as bounded image data.
+You only need to sign in once. Closing the window hides it; the playback backend
+keeps running.
 
 ## Controls
 
-- Click: open or close the bar popup
+- Click: open or close the popup
 - Middle-click: play/pause
 - Right-click: next track
 - Mouse wheel: previous/next
-- Popup: artwork, metadata, playback controls, seekable waveform, Home, and Feed
+- Popup: artwork, metadata, playback controls, and a seekable waveform
+- Home and Feed tabs: click a track to play it
+
+## Privacy and security
+
+- WebKit uses an ephemeral in-memory profile and cache; it is never given a
+  pathname to reopen for session storage.
+- The session survives restarts through a bounded, owner-only cookie jar in
+  `~/.local/share/omarchy-soundcloud/`. The account password is never stored.
+- Artwork is downloaded only from SoundCloud's `i1.sndcdn.com` CDN through a
+  bounded HTTPS fetcher, validated as PNG or JPEG, and passed to the shell as
+  bounded image data.
+- The bar connects to the backend over a mode-0600 Unix socket in the owner-only
+  `$XDG_RUNTIME_DIR/omarchy-soundcloud/` directory. The backend checks each
+  client's Unix peer credentials. Status is pushed over that connection, so normal
+  controls do not launch a new Python process.
 
 ## Backend CLI
 
 ```sh
-python3 soundcloud_app.py check
-python3 soundcloud_app.py launch       # start and show the one-time login window
+python3 soundcloud_app.py check        # check runtime dependencies (JSON)
+python3 soundcloud_app.py launch       # start the backend and show the sign-in window
 python3 soundcloud_app.py status
 python3 soundcloud_app.py play-pause
 python3 soundcloud_app.py previous
 python3 soundcloud_app.py next
-python3 soundcloud_app.py seek 0.5    # seek to 50%
+python3 soundcloud_app.py seek 0.5     # seek to 50%
 python3 soundcloud_app.py play soundcloud:tracks:123456
-python3 soundcloud_app.py show
+python3 soundcloud_app.py show         # show the SoundCloud window
 python3 soundcloud_app.py stop
 ```
 
-The bar keeps a direct connection to the backend over a mode-0600 Unix socket in
-the owner-only `$XDG_RUNTIME_DIR/omarchy-soundcloud/` directory. The backend
-checks each client's Unix peer credentials. Playback status is pushed over that
-connection; normal controls and track requests do not launch a new Python process.
+## Troubleshooting
+
+- Nothing plays: run `python3 soundcloud_app.py check` and install any missing
+  GStreamer plugins.
+- Lists or playback stop working: SoundCloud may have changed its private web API.
+  Stop the backend with `python3 soundcloud_app.py stop` and open the popup again
+  to relaunch it. If that does not help, please open an issue.
+- Some tracks never play: tracks blocked for off-platform or regional playback keep
+  SoundCloud's normal restrictions.
 
 ## Removing
 
-To retain the local SoundCloud session for a later reinstall, remove the plugin with:
+To keep the local SoundCloud session for a later reinstall, remove the plugin with:
 
 ```sh
 omarchy plugin remove brunosilveira.soundcloud
@@ -101,10 +117,10 @@ omarchy plugin remove brunosilveira.soundcloud
 
 The backend watches the installed plugin path, shuts down when it disappears,
 and removes its runtime socket. The owner-only SoundCloud cookie store is
-intentionally retained so reinstalling does not require another sign-in.
+intentionally kept so reinstalling does not require another sign-in.
 
-To remove persistent state too, do this in the shown order while the plugin is
-still installed:
+To remove persistent state too, run these commands in this order while the plugin
+is still installed:
 
 ```sh
 python3 soundcloud_app.py stop
@@ -120,12 +136,17 @@ node tests/test_soundcloud_model.js
 omarchy plugin validate .
 ```
 
+- QML changes take effect after `omarchy-restart-shell`.
+- Python changes take effect after `python3 soundcloud_app.py stop` and relaunching
+  the backend from the bar.
+
 ## Limitations
 
 SoundCloud requires Artist Pro to issue official API credentials, so this plugin uses
-the authenticated frontend's private JSON APIs through an isolated WebKit broker.
-Home and Feed are parsed separately, and selection resolves a stable track URN to a
-short-lived media URL for the local GStreamer player; selection never depends on a
-rendered SoundCloud card. These private API schemas can change without notice.
-Tracks blocked from off-platform or regional playback remain subject to SoundCloud's
-normal restrictions.
+the authenticated web app's private JSON APIs through an isolated WebKit view.
+Selecting a track resolves its stable track ID to a short-lived media URL for the
+local GStreamer player. These private API schemas can change without notice.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
