@@ -60,6 +60,11 @@ function isCurrentSelectionResponse(activeRequestId, responseId) {
   return Number(activeRequestId) > 0 && Number(activeRequestId) === Number(responseId)
 }
 
+function isCurrentTrack(trackPlaybackId, currentPlaybackId) {
+  var current = String(currentPlaybackId || "")
+  return current !== "" && String(trackPlaybackId || "") === current
+}
+
 function barIconColor(playing, accent, foreground) {
   return playing === true ? accent : foreground
 }
@@ -74,6 +79,7 @@ if (typeof module !== "undefined") {
     selectionIsPending: selectionIsPending,
     canStartAction: canStartAction,
     isCurrentSelectionResponse: isCurrentSelectionResponse,
+    isCurrentTrack: isCurrentTrack,
     barIconColor: barIconColor
   }
 }

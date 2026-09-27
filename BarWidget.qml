@@ -14,6 +14,7 @@ BarWidget {
   property bool loggedIn: false
   property bool playing: false
   property string playbackState: "idle"
+  property string playbackId: ""
   property string title: ""
   property string artist: ""
   property string artDataUrl: ""
@@ -331,6 +332,7 @@ BarWidget {
         artDataUrl = ""
       }
       title = incomingTitle
+      playbackId = String(state.playbackId || "")
       artist = String(state.artist || "").slice(0, 256)
     }
     if (popupOpen && loggedIn && !wasLoggedIn && tracks.length === 0) {
@@ -735,6 +737,7 @@ BarWidget {
             property var track: modelData
             property string artworkId: String(track.artworkId || "")
             property string trackArtDataUrl: String(root.trackArtworkData[artworkId] || "")
+            property bool isCurrent: SoundCloudModel.isCurrentTrack(track.playbackId, root.playbackId)
 
             Component.onCompleted: root.requestTrackArtwork(artworkId)
             onArtworkIdChanged: root.requestTrackArtwork(artworkId)
@@ -747,10 +750,22 @@ BarWidget {
             }
 
             Rectangle {
+              anchors.right: trackArtwork.left
+              anchors.rightMargin: Style.space(3)
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(3)
+              height: Style.space(40)
+              radius: width / 2
+              color: Color.accent
+              visible: isCurrent
+            }
+
+            Rectangle {
               id: trackArtwork
               width: Style.space(48)
               height: Style.space(48)
               anchors.left: parent.left
+              anchors.leftMargin: Style.space(6)
               anchors.verticalCenter: parent.verticalCenter
               color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08)
 
@@ -786,7 +801,8 @@ BarWidget {
                 width: parent.width
                 text: track.title || "Untitled"
                 textFormat: Text.PlainText
-                color: root.bar.foreground
+                color: isCurrent ? Color.accent : root.bar.foreground
+                font.bold: isCurrent
                 font.family: root.bar.fontFamily
                 font.pixelSize: Style.font.body
                 elide: Text.ElideRight

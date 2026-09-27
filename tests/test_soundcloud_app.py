@@ -483,6 +483,20 @@ class BackendCommandTest(unittest.TestCase):
             self.assertEqual(validated["playbackState"], state)
         self.assertIsNone(app.validate_status_payload({**base, "playbackState": "unknown"}))
 
+    def test_status_identifies_the_selected_track_so_the_list_can_mark_it(self):
+        app = load_module()
+        player = object.__new__(app.GstPlayback)
+        player.generation = 0
+        player.on_change = lambda: None
+        player._stop_current = lambda: None
+        player.begin({"title": "Selected", "playbackId": "soundcloud:tracks:9"})
+
+        validated = app.validate_status_payload({**player.status(), "loggedIn": True})
+
+        self.assertEqual(validated["playbackId"], "soundcloud:tracks:9")
+        forged = app.validate_status_payload({**player.status(), "playbackId": "javascript:1"})
+        self.assertEqual(forged["playbackId"], "")
+
     def test_native_player_begins_in_resolving_state_before_media_exists(self):
         app = load_module()
         player = object.__new__(app.GstPlayback)

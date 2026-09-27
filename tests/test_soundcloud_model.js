@@ -74,6 +74,12 @@ assert.equal(model.canStartAction(true, true, "next"), false);
 assert.equal(model.isCurrentSelectionResponse(42, 41), false);
 assert.equal(model.isCurrentSelectionResponse(42, 42), true);
 
+assert.equal(model.isCurrentTrack("soundcloud:tracks:9", "soundcloud:tracks:9"), true);
+assert.equal(model.isCurrentTrack("soundcloud:tracks:8", "soundcloud:tracks:9"), false);
+// Nothing playing must not mark rows that also lack an id.
+assert.equal(model.isCurrentTrack("", ""), false);
+assert.equal(model.isCurrentTrack(undefined, ""), false);
+
 // The bar follows the theme palette: playback uses the theme accent, while
 // every non-playing state matches the other bar icons.
 assert.equal(model.barIconColor(true, "accent", "foreground"), "accent");
