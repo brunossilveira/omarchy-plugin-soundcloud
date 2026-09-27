@@ -191,8 +191,9 @@ python3 soundcloud_app.py stop     # restart the daemon after backend changes
 python3 soundcloud_app.py status   # inspect state from the CLI
 ```
 
-QML changes take effect after a plugin rescan or shell reload. Python changes take
-effect after the daemon is stopped and relaunched from the bar.
+QML changes to an already-loaded plugin take effect only after `omarchy-restart-shell`.
+`rescanPlugins` discovers new plugins but keeps serving the cached `BarWidget.qml`.
+Python changes take effect after the daemon is stopped and relaunched from the bar.
 
 ## Conventions
 
