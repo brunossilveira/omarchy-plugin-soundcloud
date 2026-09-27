@@ -172,7 +172,7 @@ def open_runtime_event_log():
     try:
         fd = os.open(
             "pagination.log",
-            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
             0o600,
             dir_fd=directory_fd,
         )
@@ -182,6 +182,7 @@ def open_runtime_event_log():
         details = os.fstat(fd)
         if not stat.S_ISREG(details.st_mode) or details.st_uid != os.geteuid() or details.st_nlink != 1:
             raise PermissionError("refusing unsafe pagination log")
+        os.set_blocking(fd, True)
         os.fchmod(fd, 0o600)
         if details.st_size > MAX_EVENT_LOG_BYTES:
             os.ftruncate(fd, 0)
@@ -275,7 +276,7 @@ class CookieStore:
         try:
             fd = os.open(
                 self.filename,
-                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
                 dir_fd=self.directory_fd,
             )
         except FileNotFoundError:
@@ -290,6 +291,7 @@ class CookieStore:
                 or details.st_size > MAX_COOKIE_STORE_BYTES
             ):
                 raise PermissionError("refusing unsafe cookie store")
+            os.set_blocking(fd, True)
             data = bytearray()
             while len(data) <= MAX_COOKIE_STORE_BYTES:
                 chunk = os.read(fd, min(65536, MAX_COOKIE_STORE_BYTES + 1 - len(data)))
@@ -350,7 +352,7 @@ class CookieStore:
         try:
             fd = os.open(
                 "cookies.sqlite",
-                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
                 dir_fd=self.directory_fd,
             )
         except FileNotFoundError:
@@ -365,6 +367,7 @@ class CookieStore:
                 or details.st_size > MAX_COOKIE_STORE_BYTES
             ):
                 raise PermissionError("refusing unsafe legacy cookie store")
+            os.set_blocking(fd, True)
             chunks = []
             remaining = details.st_size
             while remaining:
@@ -428,7 +431,7 @@ class PrivateJsonStore:
         try:
             fd = os.open(
                 self.filename,
-                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
                 dir_fd=self.directory_fd,
             )
         except FileNotFoundError:
@@ -443,6 +446,7 @@ class PrivateJsonStore:
                 or details.st_size > self.maximum_bytes
             ):
                 return None
+            os.set_blocking(fd, True)
             data = bytearray()
             while len(data) <= self.maximum_bytes:
                 chunk = os.read(fd, min(65536, self.maximum_bytes + 1 - len(data)))

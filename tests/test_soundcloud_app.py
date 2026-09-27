@@ -106,6 +106,62 @@ class ProfilePathsTest(unittest.TestCase):
             finally:
                 os.close(directory_fd)
 
+    def assert_returns_despite_fifo(self, fifo_path, call):
+        # A same-user process can plant a FIFO at a fixed state path. Opening it
+        # without O_NONBLOCK blocks until a writer appears, hanging the daemon at
+        # startup before any file-type check runs.
+        os.mkfifo(fifo_path, 0o600)
+        outcome = {}
+
+        def run():
+            try:
+                outcome["value"] = call()
+            except Exception as exc:
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(2)
+        if worker.is_alive():
+            for flags in (os.O_WRONLY | os.O_NONBLOCK, os.O_RDONLY | os.O_NONBLOCK):
+                with contextlib.suppress(OSError):
+                    os.close(os.open(fifo_path, flags))
+            worker.join(2)
+            self.fail(f"blocked opening planted FIFO at {fifo_path.name}")
+        return outcome
+
+    def test_private_stores_refuse_planted_fifo_without_blocking(self):
+        app = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                store = app.CookieStore(directory_fd)
+                outcome = self.assert_returns_despite_fifo(Path(directory) / "cookies.json", store.load)
+                self.assertIsInstance(outcome.get("error"), PermissionError)
+
+                outcome = self.assert_returns_despite_fifo(
+                    Path(directory) / "cookies.sqlite", store.migrate_legacy_sqlite
+                )
+                self.assertIsInstance(outcome.get("error"), PermissionError)
+
+                cache = app.PrivateJsonStore(directory_fd, "tracks.json", app.MAX_TRACK_CACHE_BYTES)
+                outcome = self.assert_returns_despite_fifo(Path(directory) / "tracks.json", cache.load)
+                self.assertEqual(outcome, {"value": None})
+            finally:
+                os.close(directory_fd)
+
+    def test_runtime_event_log_refuses_planted_fifo_without_blocking(self):
+        app = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            os.chmod(directory, 0o700)
+            runtime = Path(directory) / "omarchy-soundcloud"
+            runtime.mkdir(mode=0o700)
+            with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": directory}):
+                outcome = self.assert_returns_despite_fifo(
+                    runtime / "pagination.log", app.open_runtime_event_log
+                )
+            self.assertIsInstance(outcome.get("error"), OSError)
+
     def test_track_cache_survives_backend_restart_in_owner_only_store(self):
         app = load_module()
         payload = {
