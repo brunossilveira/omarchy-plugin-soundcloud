@@ -52,6 +52,12 @@ function selectionIsPending(playbackState) {
   return playbackState === "resolving" || playbackState === "buffering"
 }
 
+function pendingLabel(playbackState) {
+  if (playbackState === "resolving") return "Loading…"
+  if (playbackState === "buffering") return "Buffering…"
+  return ""
+}
+
 function canStartAction(actionBusy, selectionBusy, action) {
   return !actionBusy || (selectionBusy === true && action === "play")
 }
@@ -77,6 +83,7 @@ if (typeof module !== "undefined") {
     contentYAfterTrackUpdate: contentYAfterTrackUpdate,
     shouldPreservePlaybackMetadata: shouldPreservePlaybackMetadata,
     selectionIsPending: selectionIsPending,
+    pendingLabel: pendingLabel,
     canStartAction: canStartAction,
     isCurrentSelectionResponse: isCurrentSelectionResponse,
     isCurrentTrack: isCurrentTrack,

@@ -517,6 +517,8 @@ class BackendCommandTest(unittest.TestCase):
         self.assertFalse(status["playerPresent"])
         self.assertFalse(status["playing"])
         self.assertEqual(player.metadata["title"], "Selected")
+        # Resolution can take seconds; the popup names what is loading.
+        self.assertEqual(status["title"], "Selected")
 
     def test_private_api_playback_resolution_stays_inside_webkit(self):
         app = load_module()

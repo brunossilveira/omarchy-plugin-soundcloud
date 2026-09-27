@@ -66,6 +66,10 @@ assert.equal(model.selectionIsPending("playing"), false);
 assert.equal(model.selectionIsPending("paused"), false);
 assert.equal(model.selectionIsPending("error"), false);
 assert.equal(model.selectionIsPending("idle"), false);
+// Every pending state needs visible feedback; settled states show none.
+for (const state of ["resolving", "buffering", "playing", "paused", "error", "idle"]) {
+  assert.equal(model.pendingLabel(state) !== "", model.selectionIsPending(state));
+}
 
 // A newer selection supersedes A while controls remain globally busy.  A's
 // eventual response cannot complete or clear B.

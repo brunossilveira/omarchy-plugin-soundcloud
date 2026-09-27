@@ -576,7 +576,7 @@ BarWidget {
           Text {
             width: parent.width
             textFormat: Text.PlainText
-            text: root.artist || (!root.running ? "Backend is stopped" : (!root.loggedIn ? "Sign in once to continue" : "Nothing playing"))
+            text: SoundCloudModel.pendingLabel(root.playbackState) || root.artist || (!root.running ? "Backend is stopped" : (!root.loggedIn ? "Sign in once to continue" : "Nothing playing"))
             color: root.dim
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -738,6 +738,7 @@ BarWidget {
             property string artworkId: String(track.artworkId || "")
             property string trackArtDataUrl: String(root.trackArtworkData[artworkId] || "")
             property bool isCurrent: SoundCloudModel.isCurrentTrack(track.playbackId, root.playbackId)
+            property string pendingLabel: isCurrent ? SoundCloudModel.pendingLabel(root.playbackState) : ""
 
             Component.onCompleted: root.requestTrackArtwork(artworkId)
             onArtworkIdChanged: root.requestTrackArtwork(artworkId)
@@ -810,9 +811,9 @@ BarWidget {
 
               Text {
                 width: parent.width
-                text: root.trackDetails(track)
+                text: pendingLabel || root.trackDetails(track)
                 textFormat: Text.PlainText
-                color: root.dim
+                color: pendingLabel ? Color.accent : root.dim
                 font.family: root.bar.fontFamily
                 font.pixelSize: Style.font.caption
                 elide: Text.ElideRight
