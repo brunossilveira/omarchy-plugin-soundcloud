@@ -13,6 +13,7 @@ BarWidget {
   property bool running: false
   property bool loggedIn: false
   property bool playing: false
+  property string playbackState: "idle"
   property string title: ""
   property string artist: ""
   property string artDataUrl: ""
@@ -20,6 +21,8 @@ BarWidget {
   property real position: 0
   property string lastError: ""
   property bool actionBusy: false
+  property bool selectionBusy: false
+  property int activeSelectionRequestId: 0
   property string selectedTab: "home"
   property var tracks: []
   property var homeTracks: []
@@ -182,7 +185,7 @@ BarWidget {
   function commandValue(action, value) {
     if (action === "launch") return "show"
     if (action === "seek") return "seek:" + String(value)
-    if (action === "play-url") return "play-url:" + String(value)
+    if (action === "play") return "play:" + String(value)
     return action
   }
 
@@ -228,19 +231,28 @@ BarWidget {
     tracksLoading = false
     trackLoadAttempts = 0
     actionBusy = false
+    selectionBusy = false
+    activeSelectionRequestId = 0
   }
 
   function runAction(action, value) {
-    if (actionBusy) return false
+    if (!SoundCloudModel.canStartAction(actionBusy, selectionBusy, action)) return false
     if (!backendConnected) {
       actionBusy = true
       startBackend(action === "launch" || action === "show")
       return true
     }
     actionBusy = true
+    selectionBusy = action === "play"
     lastError = ""
-    if (sendCommand(commandValue(action, value), "action") > 0) return true
+    var sentId = sendCommand(commandValue(action, value), selectionBusy ? "selection" : "action")
+    if (sentId > 0) {
+      if (selectionBusy) activeSelectionRequestId = sentId
+      return true
+    }
     actionBusy = false
+    selectionBusy = false
+    activeSelectionRequestId = 0
     return false
   }
 
@@ -285,16 +297,22 @@ BarWidget {
     var reportsLoggedOut = /\/(signin|register)([/?#]|$)/.test(String(state.url || ""))
     loggedIn = state.loggedIn === true || (root.loggedIn && !reportsLoggedOut)
     if (state.error) lastError = String(state.error)
-    var hasIncomingTrack = String(state.title || "") !== ""
-    var preserveMetadata = !hasIncomingTrack && root.title !== ""
-      && /^https:\/\/soundcloud\.com\/(discover|feed)([/?#]|$)/.test(String(state.url || ""))
+    playbackState = String(state.playbackState || (state.playing === true ? "playing" : "idle"))
+    if (selectionBusy && !SoundCloudModel.selectionIsPending(playbackState)) {
+      selectionBusy = false
+      activeSelectionRequestId = 0
+      actionBusy = false
+    }
+    var preserveMetadata = SoundCloudModel.shouldPreservePlaybackMetadata(state, root.title)
     playing = state.playing === true
     duration = Number(state.duration || 0)
     position = Number(state.position || 0)
     if (!preserveMetadata) {
       var incomingTitle = String(state.title || "").slice(0, 512)
       var artwork = String(state.artDataUrl || "")
-      if (/^data:image\/(png|jpeg);base64,/.test(artwork) && artwork.length <= 180000) {
+      if (state.playerPresent === false) {
+        artDataUrl = ""
+      } else if (/^data:image\/(png|jpeg);base64,/.test(artwork) && artwork.length <= 180000) {
         artDataUrl = artwork
       } else if (incomingTitle !== title) {
         artDataUrl = ""
@@ -385,6 +403,14 @@ BarWidget {
     } else if (kind === "action") {
       actionBusy = false
       if (message.ok !== true) lastError = String(message.error || "SoundCloud action failed")
+    } else if (kind === "selection") {
+      if (!SoundCloudModel.isCurrentSelectionResponse(activeSelectionRequestId, message.id)) return
+      if (message.ok !== true) {
+        selectionBusy = false
+        activeSelectionRequestId = 0
+        actionBusy = false
+        lastError = String(message.error || "SoundCloud could not select this track")
+      }
     }
   }
 
@@ -766,9 +792,10 @@ BarWidget {
             MouseArea {
               anchors.fill: parent
               cursorShape: Qt.PointingHandCursor
-              enabled: !root.actionBusy
+              enabled: (!root.actionBusy || root.selectionBusy)
+                && /^soundcloud:tracks:[1-9][0-9]*$/.test(String(track.playbackId || ""))
               onClicked: {
-                root.runAction("play-url", track.url)
+                root.runAction("play", modelData.playbackId)
               }
             }
           }

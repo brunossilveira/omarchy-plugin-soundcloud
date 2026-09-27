@@ -18,11 +18,12 @@ A dedicated SoundCloud widget for the Omarchy top bar. It keeps the normal UI in
 - Python 3 with PyGObject
 - GTK 3 and WebKitGTK 4.1
 - `gst-plugins-good` (provides WebKitGTK's required `autoaudiosink`)
+- `gst-libav` (provides AAC decoding for current SoundCloud HLS streams)
 
 Install the GStreamer plugin package if needed:
 
 ```sh
-omarchy pkg add gst-plugins-good
+omarchy pkg add gst-plugins-good gst-libav
 ```
 
 Verify all runtime dependencies with:
@@ -80,6 +81,7 @@ python3 soundcloud_app.py play-pause
 python3 soundcloud_app.py previous
 python3 soundcloud_app.py next
 python3 soundcloud_app.py seek 0.5    # seek to 50%
+python3 soundcloud_app.py play soundcloud:tracks:123456
 python3 soundcloud_app.py show
 python3 soundcloud_app.py stop
 ```
@@ -120,4 +122,10 @@ omarchy plugin validate .
 
 ## Limitations
 
-This plugin uses SoundCloud's web player because SoundCloud requires Artist Pro to issue official API credentials. SoundCloud can change its page structure without notice; if its playback controls or metadata markup changes, the DOM selectors in `soundcloud_app.py` may need updating. Tracks blocked from off-platform or regional playback remain subject to SoundCloud's normal restrictions.
+SoundCloud requires Artist Pro to issue official API credentials, so this plugin uses
+the authenticated frontend's private JSON APIs through an isolated WebKit broker.
+Home and Feed are parsed separately, and selection resolves a stable track URN to a
+short-lived media URL for the local GStreamer player; selection never depends on a
+rendered SoundCloud card. These private API schemas can change without notice.
+Tracks blocked from off-platform or regional playback remain subject to SoundCloud's
+normal restrictions.

@@ -73,6 +73,29 @@ assert.equal(model.shouldLoadMoreTracks({
 assert.equal(model.contentYAfterTrackUpdate(240, 11, 21), 240);
 assert.equal(model.contentYAfterTrackUpdate(240, 21, 21), null);
 
+// A badge restored by SoundCloud without a real audio player is stale. The UI
+// must clear it instead of preserving it as an actionable current track.
+assert.equal(model.shouldPreservePlaybackMetadata({
+  playerPresent: false, title: "", url: "https://soundcloud.com/feed",
+}, "Old track"), false);
+assert.equal(model.shouldPreservePlaybackMetadata({
+  playerPresent: true, title: "", url: "https://soundcloud.com/feed",
+}, "Playing track"), true);
+
+assert.equal(model.selectionIsPending("resolving"), true);
+assert.equal(model.selectionIsPending("buffering"), true);
+assert.equal(model.selectionIsPending("playing"), false);
+assert.equal(model.selectionIsPending("paused"), false);
+assert.equal(model.selectionIsPending("error"), false);
+assert.equal(model.selectionIsPending("idle"), false);
+
+// A newer selection supersedes A while controls remain globally busy.  A's
+// eventual response cannot complete or clear B.
+assert.equal(model.canStartAction(true, true, "play"), true);
+assert.equal(model.canStartAction(true, true, "next"), false);
+assert.equal(model.isCurrentSelectionResponse(42, 41), false);
+assert.equal(model.isCurrentSelectionResponse(42, 42), true);
+
 var requestEvents = [];
 function observeListEvent(reason, count, hasMore) {
   if (model.shouldLoadMoreTracks({

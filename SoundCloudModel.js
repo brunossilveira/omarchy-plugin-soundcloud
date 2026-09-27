@@ -66,6 +66,26 @@ function contentYAfterTrackUpdate(previousY, previousCount, nextCount) {
   return Number.isFinite(y) && after > before ? y : null
 }
 
+function shouldPreservePlaybackMetadata(state, currentTitle) {
+  state = state || {}
+  return state.playerPresent !== false
+    && String(state.title || "") === ""
+    && String(currentTitle || "") !== ""
+    && /^https:\/\/soundcloud\.com\/(discover|feed)([/?#]|$)/.test(String(state.url || ""))
+}
+
+function selectionIsPending(playbackState) {
+  return playbackState === "resolving" || playbackState === "buffering"
+}
+
+function canStartAction(actionBusy, selectionBusy, action) {
+  return !actionBusy || (selectionBusy === true && action === "play")
+}
+
+function isCurrentSelectionResponse(activeRequestId, responseId) {
+  return Number(activeRequestId) > 0 && Number(activeRequestId) === Number(responseId)
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     searchablePlayerText: searchablePlayerText,
@@ -75,6 +95,10 @@ if (typeof module !== "undefined") {
     displayLabel: displayLabel,
     applyTrackResult: applyTrackResult,
     shouldLoadMoreTracks: shouldLoadMoreTracks,
-    contentYAfterTrackUpdate: contentYAfterTrackUpdate
+    contentYAfterTrackUpdate: contentYAfterTrackUpdate,
+    shouldPreservePlaybackMetadata: shouldPreservePlaybackMetadata,
+    selectionIsPending: selectionIsPending,
+    canStartAction: canStartAction,
+    isCurrentSelectionResponse: isCurrentSelectionResponse
   }
 }

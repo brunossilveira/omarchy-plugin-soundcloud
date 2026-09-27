@@ -133,6 +133,7 @@ class ProfilePathsTest(unittest.TestCase):
         app = load_module()
         cache = app.sanitize_track_cache({
             "home": [{
+                "playbackId": "soundcloud:tracks:123",
                 "title": "Track",
                 "artist": "Artist",
                 "url": "https://soundcloud.com/artist/track",
@@ -146,7 +147,7 @@ class ProfilePathsTest(unittest.TestCase):
 
         self.assertEqual(set(cache), {"home"})
         self.assertEqual(set(cache["home"][0]), {
-            "title", "artist", "url", "artUrl", "playCount", "durationMs",
+            "playbackId", "title", "artist", "url", "artUrl", "playCount", "durationMs",
         })
         self.assertEqual(
             cache["home"][0]["artUrl"],
@@ -374,7 +375,7 @@ class BackendCommandTest(unittest.TestCase):
 
         script = app.status_script()
 
-        for field in ("playing", "title", "artist", "artUrl", "loggedIn", "url"):
+        for field in ("playerPresent", "playing", "title", "artist", "artUrl", "loggedIn", "url"):
             self.assertIn(field, script)
         self.assertIn("playControls__play", script)
         self.assertIn("Pause", script)
@@ -383,6 +384,99 @@ class BackendCommandTest(unittest.TestCase):
         self.assertIn("getComputedStyle(art).backgroundImage", script)
         self.assertIn(".playbackSoundBadge__avatar [style*=\"background-image\"]", script)
         self.assertIn("signin|register", script)
+
+    def test_status_script_clears_stale_badge_without_an_audio_player(self):
+        app = load_module()
+        script = app.status_script()
+
+        self.assertIn("const playerPresent = !!audio", script)
+        self.assertIn("playing: playerPresent ? !audio.paused : false", script)
+        self.assertIn("artUrl: playerPresent ? artUrl : ''", script)
+        validated = app.validate_status_payload({
+            "playerPresent": False,
+            "playing": False,
+            "title": "",
+            "artist": "",
+            "artUrl": "",
+            "loggedIn": True,
+            "url": "https://soundcloud.com/feed",
+            "duration": 0,
+            "position": 0,
+        })
+        self.assertIsNotNone(validated)
+        self.assertFalse(validated["playerPresent"])
+
+    def test_status_validation_preserves_only_explicit_playback_states(self):
+        app = load_module()
+        base = {
+            "playerPresent": False,
+            "playing": False,
+            "title": "",
+            "artist": "",
+            "artUrl": "",
+            "loggedIn": True,
+            "url": "https://soundcloud.com/feed",
+            "duration": 0,
+            "position": 0,
+        }
+
+        for state in ("idle", "resolving", "buffering", "playing", "paused", "error"):
+            validated = app.validate_status_payload({**base, "playbackState": state})
+            self.assertEqual(validated["playbackState"], state)
+        self.assertIsNone(app.validate_status_payload({**base, "playbackState": "unknown"}))
+
+    def test_native_player_begins_in_resolving_state_before_media_exists(self):
+        app = load_module()
+        player = object.__new__(app.GstPlayback)
+        player.active = True
+        player.playing = True
+        player.metadata = {"title": "Old"}
+        player.error = "old error"
+        player.state = "playing"
+        player.generation = 7
+        player.on_change = lambda: None
+        player._stop_current = lambda: setattr(player, "generation", player.generation + 1)
+
+        generation = player.begin({"title": "Selected", "playbackId": "soundcloud:tracks:9"})
+        status = player.status()
+
+        self.assertEqual(generation, 8)
+        self.assertEqual(status["playbackState"], "resolving")
+        self.assertFalse(status["playerPresent"])
+        self.assertFalse(status["playing"])
+        self.assertEqual(player.metadata["title"], "Selected")
+
+    def test_private_api_playback_resolution_stays_inside_webkit(self):
+        app = load_module()
+        script = app.api_request_capture_script()
+
+        self.assertIn("const playbackTracks = new Map()", script)
+        self.assertIn("window.__omarchyPlayApiTrack", script)
+        self.assertIn("headers: new Headers(context.headers)", script)
+        self.assertIn("messageHandlers.omarchyPlayback.postMessage", script)
+        self.assertIn("const generation = ++playbackGeneration", script)
+        self.assertIn("if (generation !== playbackGeneration) return", script)
+        self.assertIn("if (pageAudio && !pageAudio.paused) pageAudio.pause()", script)
+        self.assertNotIn("window.playbackTracks", script)
+
+    def test_stream_urls_are_strictly_limited_to_soundcloud_media_hosts(self):
+        app = load_module()
+
+        self.assertEqual(
+            app.validate_stream_uri("https://cf-hls-media.sndcdn.com/media/test.m3u8?token=private"),
+            "https://cf-hls-media.sndcdn.com/media/test.m3u8?token=private",
+        )
+        self.assertEqual(
+            app.validate_stream_uri("https://playback.media-streaming.soundcloud.cloud/test"),
+            "https://playback.media-streaming.soundcloud.cloud/test",
+        )
+        for value in (
+            "http://cf-hls-media.sndcdn.com/test",
+            "https://sndcdn.com.evil.example/test",
+            "https://user:pass@cf-hls-media.sndcdn.com/test",
+            "https://example.com/test",
+        ):
+            self.assertIsNone(app.validate_stream_uri(value))
 
     def test_source_routes_are_fixed_soundcloud_pages(self):
         app = load_module()
@@ -422,6 +516,17 @@ class BackendCommandTest(unittest.TestCase):
         self.assertEqual(app.load_more_source_from_command("load-more:feed"), "feed")
         self.assertIsNone(app.load_more_source_from_command("load-more"))
         self.assertIsNone(app.load_more_source_from_command("load-more:likes"))
+
+    def test_play_command_accepts_only_stable_soundcloud_track_ids(self):
+        app = load_module()
+
+        self.assertEqual(
+            app.playback_id_from_command("play:soundcloud:tracks:123"),
+            "soundcloud:tracks:123",
+        )
+        self.assertIsNone(app.playback_id_from_command("play:soundcloud:tracks:0"))
+        self.assertIsNone(app.playback_id_from_command("play-url:https://soundcloud.com/a/b"))
+        self.assertIsNone(app.playback_id_from_command("play:soundcloud:users:123"))
 
     def test_track_pages_append_unique_tracks_and_new_navigation_resets(self):
         app = load_module()
@@ -471,7 +576,7 @@ window.webkit = {{ messageHandlers: {{ omarchyTracks: {{ postMessage(value) {{ p
 window.fetch = async function(input, init) {{
   calls.push(typeof input === 'string' ? input : input.url);
   const body = JSON.stringify(pages.shift());
-  return {{ ok: true, clone() {{ return this; }}, async text() {{ return body; }} }};
+  return new Response(body, {{ status: 200 }});
 }};
 global.XMLHttpRequest = function() {{}};
 XMLHttpRequest.prototype.open = function() {{}};
@@ -525,7 +630,7 @@ window.fetch = async function() {{
     collection: [{{ permalink_url: 'https://soundcloud.com/a/one', title: 'One', duration: 1000 }}],
     next_href: 'https://api-v2.soundcloud.com/stream?offset=10'
   }});
-  return {{ ok: true, clone() {{ return this; }}, async text() {{ return body; }} }};
+  return new Response(body, {{ status: 200 }});
 }};
 global.XMLHttpRequest = function() {{}};
 XMLHttpRequest.prototype.open = function() {{}};
@@ -577,7 +682,7 @@ window.webkit = {{ messageHandlers: {{ omarchyTracks: {{ postMessage() {{}} }} }
 window.fetch = async function(input) {{
   calls.push(typeof input === 'string' ? input : input.url);
   const body = JSON.stringify(pages.shift());
-  return {{ ok: true, clone() {{ return this; }}, async text() {{ return body; }} }};
+  return new Response(body, {{ status: 200 }});
 }};
 global.XMLHttpRequest = function() {{}};
 XMLHttpRequest.prototype.open = function() {{}};
@@ -640,29 +745,494 @@ eval({json.dumps(capture_script)});
         self.assertNotIn("fetch(", tracks_script)
         self.assertNotIn("performance.getEntriesByType", tracks_script)
 
+    def test_private_transcoding_endpoints_reject_userinfo_and_nonstandard_ports(self):
+        app = load_module()
+        capture_script = app.api_request_capture_script()
+        harness = f"""
+const posted = [];
+global.location = {{ href: 'https://soundcloud.com/feed', hostname: 'soundcloud.com', pathname: '/feed' }};
+global.window = global;
+window.webkit = {{ messageHandlers: {{ omarchyTracks: {{ postMessage(value) {{ posted.push(JSON.parse(value)); }} }} }} }};
+const encode = (value) => new TextEncoder().encode(JSON.stringify(value));
+const response = (value) => {{
+  const bytes = encode(value); let sent = false; let cancelled = false;
+  return {{ ok: true, headers: new Headers({{'content-length': String(bytes.length)}}), clone() {{ return response(value); }},
+    body: {{ getReader() {{ return {{ async read() {{ if (sent) return {{done:true}}; sent=true; return {{done:false,value:bytes}}; }}, async cancel() {{ cancelled=true; }} }}; }} }} }};
+}};
+window.fetch = async () => response({{ collection: [
+  {{kind:'track',id:1,title:'Userinfo',duration:1,permalink_url:'https://soundcloud.com/a/one',media:{{transcodings:[{{url:'https://user:pass@api-v2.soundcloud.com/media/one',format:{{protocol:'progressive',mime_type:'audio/mpeg'}}}}]}}}},
+  {{kind:'track',id:2,title:'Port',duration:1,permalink_url:'https://soundcloud.com/a/two',media:{{transcodings:[{{url:'https://api-v2.soundcloud.com:8443/media/two',format:{{protocol:'progressive',mime_type:'audio/mpeg'}}}}]}}}}
+], next_href:null}});
+global.XMLHttpRequest = function() {{}};
+XMLHttpRequest.prototype.open = function() {{}}; XMLHttpRequest.prototype.setRequestHeader = function() {{}};
+XMLHttpRequest.prototype.send = function() {{}}; XMLHttpRequest.prototype.addEventListener = function() {{}};
+eval({json.dumps(capture_script)});
+(async () => {{
+  await window.fetch(new Request('https://api-v2.soundcloud.com/stream', {{headers:{{authorization:'secret'}}}}));
+  for (let i=0;i<5;i++) await new Promise(setImmediate);
+  process.stdout.write(JSON.stringify(posted));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+        completed = subprocess.run(["node", "-e", harness], check=True, capture_output=True, text=True)
+        tracks = json.loads(completed.stdout)[0]["tracks"]
+        self.assertEqual([track.get("playbackId", "") for track in tracks], ["", ""])
+        self.assertNotIn("secret", completed.stdout)
+
+    def test_broker_response_reader_cancels_an_over_limit_stream(self):
+        app = load_module()
+        script = app.api_request_capture_script()
+        harness = f"""
+let cancelled = false; let reads = 0;
+global.location = {{href:'https://soundcloud.com/feed',hostname:'soundcloud.com',pathname:'/feed'}};
+global.window = global;
+window.webkit = {{messageHandlers:{{omarchyTracks:{{postMessage(){{}}}},omarchyPlayback:{{postMessage(){{}}}}}}}};
+const chunk = new Uint8Array(1024 * 1024);
+const makeResponse = () => ({{ok:true,headers:new Headers(),clone(){{return makeResponse();}},body:{{getReader(){{return {{async read(){{reads++;return {{done:false,value:chunk}};}},async cancel(){{cancelled=true;}}}};}}}}}});
+window.fetch = async () => makeResponse();
+global.XMLHttpRequest=function(){{}}; XMLHttpRequest.prototype.open=function(){{}};
+XMLHttpRequest.prototype.setRequestHeader=function(){{}}; XMLHttpRequest.prototype.send=function(){{}};
+XMLHttpRequest.prototype.addEventListener=function(){{}};
+eval({json.dumps(script)});
+(async()=>{{await window.fetch('https://api-v2.soundcloud.com/stream'); for(let i=0;i<6;i++) await new Promise(setImmediate); process.stdout.write(JSON.stringify({{cancelled,reads}}));}})();
+"""
+        result = json.loads(subprocess.run(
+            ["node", "-e", harness], check=True, capture_output=True, text=True
+        ).stdout)
+        self.assertTrue(result["cancelled"])
+        self.assertEqual(result["reads"], 3)
+
+    def test_newer_home_request_wins_and_embedded_tracks_are_combined_with_expanded_ids(self):
+        app = load_module()
+        script = app.api_request_capture_script()
+        harness = f"""
+const posted=[]; let finishExpansion;
+global.location={{href:'https://soundcloud.com/discover',hostname:'soundcloud.com',pathname:'/discover'}}; global.window=global;
+window.webkit={{messageHandlers:{{omarchyTracks:{{postMessage(v){{posted.push(JSON.parse(v));}}}},omarchyPlayback:{{postMessage(){{}}}}}}}};
+const resp=(value)=>{{const bytes=new TextEncoder().encode(JSON.stringify(value));return {{ok:true,headers:new Headers(),clone(){{return resp(value);}},body:{{getReader(){{let sent=false;return {{async read(){{if(sent)return {{done:true}};sent=true;return {{done:false,value:bytes}};}},async cancel(){{}}}};}}}}}};}};
+const old={{collection:[{{kind:'track',id:1,title:'Embedded',duration:1,permalink_url:'https://soundcloud.com/a/embedded'}},{{items:{{collection:[{{tracks:[{{id:2}}]}}]}}}}],next_href:null}};
+const newer={{collection:[{{kind:'track',id:3,title:'Newer',duration:1,permalink_url:'https://soundcloud.com/a/newer'}}],next_href:null}};
+window.fetch=async(input)=>{{const url=typeof input==='string'?input:input.url;if(url.includes('/tracks?'))return new Promise(r=>{{finishExpansion=()=>r(resp([{{kind:'track',id:2,title:'Expanded',duration:1,permalink_url:'https://soundcloud.com/a/expanded'}}]));}});if(url.includes('old'))return resp(old);return resp(newer);}};
+global.XMLHttpRequest=function(){{}}; XMLHttpRequest.prototype.open=function(){{}}; XMLHttpRequest.prototype.setRequestHeader=function(){{}}; XMLHttpRequest.prototype.send=function(){{}}; XMLHttpRequest.prototype.addEventListener=function(){{}};
+eval({json.dumps(script)});
+(async()=>{{await window.fetch('https://api-v2.soundcloud.com/mixed-selections?old=1');for(let i=0;i<3;i++)await new Promise(setImmediate);await window.fetch('https://api-v2.soundcloud.com/mixed-selections?new=1');for(let i=0;i<5;i++)await new Promise(setImmediate);finishExpansion();for(let i=0;i<8;i++)await new Promise(setImmediate);process.stdout.write(JSON.stringify(posted));}})();
+"""
+        posted = json.loads(subprocess.run(
+            ["node", "-e", harness], check=True, capture_output=True, text=True
+        ).stdout)
+        self.assertEqual([[track["title"] for track in event["tracks"]] for event in posted], [["Newer"]])
+
+    def test_superseded_home_expansion_cannot_replace_newer_playback_metadata(self):
+        app = load_module()
+        script = app.api_request_capture_script()
+        harness = f"""
+const posted=[]; const playback=[]; const mediaCalls=[]; let finishOldExpansion;
+global.location={{href:'https://soundcloud.com/discover',hostname:'soundcloud.com',pathname:'/discover'}};
+global.document={{querySelector(){{return null;}}}}; global.window=global;
+window.webkit={{messageHandlers:{{omarchyTracks:{{postMessage(v){{posted.push(JSON.parse(v));}}}},omarchyPlayback:{{postMessage(v){{const {{streamUrl,...safe}}=JSON.parse(v);playback.push(safe);}}}}}}}};
+const resp=(value)=>new Response(JSON.stringify(value),{{status:200}});
+const track=(title,endpoint)=>({{kind:'track',id:7,urn:'soundcloud:tracks:7',title,duration:1,permalink_url:'https://soundcloud.com/a/'+title.toLowerCase(),media:{{transcodings:[{{url:'https://api-v2.soundcloud.com/media/'+endpoint,format:{{protocol:'progressive',mime_type:'audio/mpeg'}}}}]}}}});
+const old={{collection:[{{items:{{collection:[{{tracks:[{{id:7}}]}}]}}}}],next_href:null}};
+const newer={{collection:[track('New','new')],next_href:null}};
+window.fetch=async(input)=>{{
+  const url=typeof input==='string'?input:input.url;
+  if(url.includes('/tracks?'))return new Promise(resolve=>{{finishOldExpansion=()=>resolve(resp([track('Old','old')]));}});
+  if(url.includes('/media/')){{mediaCalls.push(new URL(url).pathname);return resp({{url:'https://cf-media.sndcdn.com/audio.mp3'}});}}
+  return resp(url.includes('old=1')?old:newer);
+}};
+global.XMLHttpRequest=function(){{}}; XMLHttpRequest.prototype.open=function(){{}}; XMLHttpRequest.prototype.setRequestHeader=function(){{}}; XMLHttpRequest.prototype.send=function(){{}}; XMLHttpRequest.prototype.addEventListener=function(){{}};
+eval({json.dumps(script)});
+(async()=>{{
+  await window.fetch('https://api-v2.soundcloud.com/mixed-selections?old=1');
+  for(let i=0;i<3;i++)await new Promise(setImmediate);
+  await window.fetch('https://api-v2.soundcloud.com/mixed-selections?new=1');
+  for(let i=0;i<5;i++)await new Promise(setImmediate);
+  finishOldExpansion();
+  for(let i=0;i<8;i++)await new Promise(setImmediate);
+  window.__omarchyPlayApiTrack('soundcloud:tracks:7',9);
+  for(let i=0;i<8;i++)await new Promise(setImmediate);
+  process.stdout.write(JSON.stringify({{posted,playback,mediaCalls}}));
+}})().catch((error)=>{{console.error(error);process.exit(1);}});
+"""
+        result = json.loads(subprocess.run(
+            ["node", "-e", harness], check=True, capture_output=True, text=True
+        ).stdout)
+
+        self.assertEqual([track["title"] for track in result["posted"][0]["tracks"]], ["New"])
+        self.assertEqual([message["track"]["title"] for message in result["playback"]], ["New"])
+        self.assertEqual(result["mediaCalls"], ["/media/new"])
+        self.assertNotIn("Old", json.dumps(result))
+
+    def test_cached_selection_waits_for_request_context(self):
+        app = load_module()
+        script = app.api_request_capture_script()
+        harness = f"""
+const playback=[]; const calls=[];
+global.location={{href:'https://soundcloud.com/feed',hostname:'soundcloud.com',pathname:'/feed'}};global.document={{querySelector(){{return null;}}}};global.window=global;
+window.webkit={{messageHandlers:{{omarchyTracks:{{postMessage(){{}}}},omarchyPlayback:{{postMessage(v){{playback.push(JSON.parse(v));}}}}}}}};
+const resp=(v)=>{{const b=new TextEncoder().encode(JSON.stringify(v));return {{ok:true,headers:new Headers(),clone(){{return resp(v);}},body:{{getReader(){{let s=false;return {{async read(){{if(s)return {{done:true}};s=true;return {{done:false,value:b}};}},async cancel(){{}}}};}}}}}};}};
+window.fetch=async(input)=>{{const u=typeof input==='string'?input:input.url;calls.push(u);if(u.includes('/tracks?'))return resp([{{kind:'track',id:9,title:'Cached',duration:1,permalink_url:'https://soundcloud.com/a/cached',media:{{transcodings:[{{url:'https://api-v2.soundcloud.com/media/cached',format:{{protocol:'progressive',mime_type:'audio/mpeg'}}}}]}}}}]);if(u.includes('/media/'))return resp({{url:'https://cf-media.sndcdn.com/cached.mp3?token=private'}});return resp({{collection:[],next_href:null}});}};
+global.XMLHttpRequest=function(){{}};XMLHttpRequest.prototype.open=function(){{}};XMLHttpRequest.prototype.setRequestHeader=function(){{}};XMLHttpRequest.prototype.send=function(){{}};XMLHttpRequest.prototype.addEventListener=function(){{}};
+eval({json.dumps(script)});
+(async()=>{{const accepted=window.__omarchyPlayApiTrack('soundcloud:tracks:9',7);await new Promise(r=>setTimeout(r,20));await window.fetch('https://api-v2.soundcloud.com/stream?client_id=test');for(let i=0;i<12;i++)await new Promise(setImmediate);process.stdout.write(JSON.stringify({{accepted,calls,playback:playback.map(({{streamUrl,...x}})=>x)}}));}})();
+"""
+        result = json.loads(subprocess.run(
+            ["node", "-e", harness], check=True, capture_output=True, text=True
+        ).stdout)
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["playback"][0]["requestId"], 7)
+        self.assertNotIn("token=private", json.dumps(result))
+
+    def test_backend_resolution_timeout_invalidates_the_waiting_webkit_generation(self):
+        app = load_module()
+        script = app.api_request_capture_script()
+        source = MODULE_PATH.read_text()
+
+        self.assertIn("const waitDeadline = Date.now() + 30000", script)
+        timeout_method = source[source.index("def _resolution_timed_out"):source.index(
+            "def _respond", source.index("def _resolution_timed_out")
+        )]
+        self.assertIn("self.selection_generation += 1", timeout_method)
+
+    def test_gst_selection_uses_a_fresh_pipeline_and_ignores_retired_bus_messages(self):
+        app = load_module()
+        class Bus:
+            def __init__(self): self.handler = None; self.disconnected = False
+            def add_signal_watch(self): pass
+            def connect(self, _name, callback, pipeline, generation):
+                self.handler = (callback, pipeline, generation); return 1
+            def disconnect(self, _handler): self.disconnected = True
+            def remove_signal_watch(self): pass
+        class Pipeline:
+            def __init__(self, name): self.name=name; self.bus=Bus(); self.states=[]
+            def get_bus(self): return self.bus
+            def set_property(self, *_args): pass
+            def set_state(self, state): self.states.append(state); return Gst.StateChangeReturn.SUCCESS
+        class Factory:
+            made=[]
+            @classmethod
+            def make(cls, _kind, name): p=Pipeline(name); cls.made.append(p); return p
+        class Gst:
+            ElementFactory=Factory
+            class State: NULL='null'; PLAYING='playing'; PAUSED='paused'
+            class StateChangeReturn: FAILURE='failure'; SUCCESS='success'
+            class MessageType: ERROR='error'; EOS='eos'; STATE_CHANGED='state'
+            @staticmethod
+            def init(_value): pass
+        player = app.GstPlayback(Gst, lambda: None)
+        self.assertTrue(player.hls_slots.acquire(blocking=False))
+        self.assertTrue(player.hls_slots.acquire(blocking=False))
+        self.assertFalse(player.hls_slots.acquire(blocking=False))
+        player.hls_slots.release()
+        player.hls_slots.release()
+        player.begin({"title":"A"}); self.assertTrue(player.play("https://x", {"title":"A"}))
+        first = player.current
+        player.begin({"title":"B"}); self.assertTrue(first.bus.disconnected)
+        self.assertTrue(player.play("https://y", {"title":"B"}))
+        second = player.current
+        self.assertIsNot(first, second)
+        message = type("Message", (), {"type": Gst.MessageType.ERROR, "src": first})()
+        player._message(None, message, first, player.generation - 1)
+        self.assertIs(player.current, second)
+        self.assertNotEqual(player.state, "error")
+
+    def test_failed_gstreamer_pipelines_are_disconnected_and_set_to_null(self):
+        app = load_module()
+
+        class Bus:
+            def __init__(self): self.disconnected = False; self.watch_removed = False
+            def add_signal_watch(self): pass
+            def connect(self, *_args): return 1
+            def disconnect(self, _handler): self.disconnected = True
+            def remove_signal_watch(self): self.watch_removed = True
+
+        class Pipeline:
+            def __init__(self): self.bus = Bus(); self.states = []; self.source = object()
+            def get_bus(self): return self.bus
+            def get_by_name(self, _name): return self.source
+            def set_property(self, *_args): pass
+            def set_state(self, state):
+                self.states.append(state)
+                return Gst.StateChangeReturn.FAILURE if state == Gst.State.PLAYING else Gst.StateChangeReturn.SUCCESS
+
+        class Factory:
+            made = []
+            @classmethod
+            def make(cls, *_args):
+                pipeline = Pipeline(); cls.made.append(pipeline); return pipeline
+
+        class Gst:
+            ElementFactory = Factory
+            class State: NULL = "null"; PLAYING = "playing"; PAUSED = "paused"
+            class StateChangeReturn: FAILURE = "failure"; SUCCESS = "success"
+            @staticmethod
+            def init(_value): pass
+            @staticmethod
+            def parse_launch(_description):
+                pipeline = Pipeline(); Factory.made.append(pipeline); return pipeline
+
+        for protocol, mime_type in (("", ""), ("hls", "audio/mpeg")):
+            with self.subTest(protocol=protocol or "progressive"):
+                player = app.GstPlayback(Gst, lambda: None)
+                self.assertFalse(player.play(
+                    "https://example.invalid/audio", {"title": "Track"}, protocol, mime_type
+                ))
+                failed = Factory.made[-1]
+                self.assertIsNone(player.current)
+                self.assertTrue(failed.bus.disconnected)
+                self.assertTrue(failed.bus.watch_removed)
+                self.assertEqual(failed.states, [Gst.State.PLAYING, Gst.State.NULL])
+                player.hls_executor.shutdown(wait=False, cancel_futures=True)
+
+    def test_hls_fetch_has_deadline_cancellation_and_proxy_isolation(self):
+        app = load_module()
+        self.assertEqual(app.HLS_MAX_WORKERS, 2)
+        self.assertIn("ProxyHandler({})", MODULE_PATH.read_text())
+        with self.assertRaises(TimeoutError):
+            app.fetch_private_media(
+                "https://cf-media.sndcdn.com/a", 10, deadline=time.monotonic() - 1
+            )
+        with self.assertRaises(app.concurrent.futures.CancelledError):
+            app.fetch_private_media(
+                "https://cf-media.sndcdn.com/a", 10, cancelled=lambda: True
+            )
+
+    def test_hls_fetch_enforces_deadline_during_slow_drip_reads(self):
+        app = load_module()
+
+        class SlowDripResponse:
+            def __init__(self):
+                self.headers = {}
+                self.read_sizes = []
+                self.read1_sizes = []
+
+            def __enter__(self): return self
+            def __exit__(self, *_args): pass
+            def geturl(self): return "https://cf-media.sndcdn.com/slow"
+
+            def read(self, size):
+                self.read_sizes.append(size)
+                time.sleep(0.2)
+                return b"x"
+
+            def read1(self, size):
+                self.read1_sizes.append(size)
+                time.sleep(0.01)
+                return b"x"
+
+        response = SlowDripResponse()
+        deadline = time.monotonic() + 0.03
+        started = time.monotonic()
+        with mock.patch.object(app._media_opener, "open", return_value=response):
+            with self.assertRaises(TimeoutError):
+                app.fetch_private_media(
+                    "https://cf-media.sndcdn.com/slow",
+                    1024 * 1024,
+                    deadline=deadline,
+                )
+
+        self.assertLess(time.monotonic() - started, 0.12)
+        self.assertEqual(response.read_sizes, [])
+        self.assertGreaterEqual(len(response.read1_sizes), 2)
+        self.assertTrue(all(size <= 64 * 1024 for size in response.read1_sizes))
+
     def test_api_request_capture_pushes_the_frontends_completed_response(self):
         app = load_module()
 
         script = app.api_request_capture_script()
 
-        self.assertIn("response.clone().text()", script)
+        self.assertIn("boundedText(response.clone(), 2 * 1024 * 1024)", script)
         self.assertIn("addEventListener('load'", script)
         self.assertIn("messageHandlers.omarchyTracks.postMessage", script)
-        self.assertIn("const tracks = normalise(payload)", script)
+        self.assertIn("await homeTracks(payload, context, stagedPlayback)", script)
         self.assertIn("reset", script)
+
+    def test_home_mixed_selections_expand_playlist_track_ids_into_real_tracks(self):
+        app = load_module()
+        capture_script = app.api_request_capture_script()
+        harness = f"""
+const posted = [];
+const calls = [];
+global.location = {{ href: 'https://soundcloud.com/discover', hostname: 'soundcloud.com', pathname: '/discover' }};
+global.window = global;
+window.webkit = {{ messageHandlers: {{
+  omarchyTracks: {{ postMessage(value) {{ posted.push(JSON.parse(value)); }} }},
+  omarchyPlayback: {{ postMessage() {{}} }}
+}} }};
+window.fetch = async function(input, init) {{
+  const url = typeof input === 'string' ? input : input.url;
+  calls.push(url);
+  const payload = url.includes('/tracks?') ? [
+    {{ kind: 'track', id: 11, urn: 'soundcloud:tracks:11', permalink_url: 'https://soundcloud.com/a/one', title: 'One', duration: 1000, user: {{ username: 'A' }}, media: {{ transcodings: [{{ url: 'https://api-v2.soundcloud.com/media/one', format: {{ protocol: 'progressive', mime_type: 'audio/mpeg' }} }}] }} }},
+    {{ kind: 'track', id: 22, urn: 'soundcloud:tracks:22', permalink_url: 'https://soundcloud.com/b/two', title: 'Two', duration: 2000, user: {{ username: 'B' }}, media: {{ transcodings: [{{ url: 'https://api-v2.soundcloud.com/media/two', format: {{ protocol: 'hls', mime_type: 'audio/mp4' }} }}] }} }}
+  ] : {{ collection: [
+    {{ kind: 'track', id: 33, urn: 'soundcloud:tracks:33', permalink_url: 'https://soundcloud.com/c/embedded', title: 'Embedded', duration: 3000, user: {{ username: 'C' }}, media: {{ transcodings: [{{ url: 'https://api-v2.soundcloud.com/media/embedded', format: {{ protocol: 'progressive', mime_type: 'audio/mpeg' }} }}] }} }},
+    {{ kind: 'selection', items: {{ collection: [{{ kind: 'system-playlist', tracks: [{{ id: 11 }}, {{ id: 22 }}] }}] }} }}
+  ], next_href: null }};
+  const body = JSON.stringify(payload);
+  return new Response(body, {{ status: 200 }});
+}};
+global.XMLHttpRequest = function() {{}};
+XMLHttpRequest.prototype.open = function() {{}};
+XMLHttpRequest.prototype.setRequestHeader = function() {{}};
+XMLHttpRequest.prototype.send = function() {{}};
+XMLHttpRequest.prototype.addEventListener = function() {{}};
+eval({json.dumps(capture_script)});
+(async () => {{
+  await window.fetch(new Request('https://api-v2.soundcloud.com/mixed-selections?client_id=public-test', {{ headers: {{ authorization: 'OAuth private-test-value' }} }}));
+  for (let index = 0; index < 6; index++) await new Promise(setImmediate);
+  process.stdout.write(JSON.stringify({{ calls, posted }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+        completed = subprocess.run(
+            ["node", "-e", harness],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        result = json.loads(completed.stdout)
+
+        self.assertEqual(len(result["posted"]), 1)
+        self.assertEqual(
+            [track["title"] for track in result["posted"][0]["tracks"]],
+            ["Embedded", "One", "Two"],
+        )
+        self.assertEqual(
+            [track["playbackId"] for track in result["posted"][0]["tracks"]],
+            ["soundcloud:tracks:33", "soundcloud:tracks:11", "soundcloud:tracks:22"],
+        )
+        self.assertIn("/tracks?", result["calls"][1])
+        self.assertNotIn("private-test-value", completed.stdout)
+
+    def test_playback_resolves_unknown_track_id_directly_without_dom_or_list_map(self):
+        app = load_module()
+        capture_script = app.api_request_capture_script()
+        harness = f"""
+const playback = [];
+const calls = [];
+global.location = {{ href: 'https://soundcloud.com/feed', hostname: 'soundcloud.com', pathname: '/feed' }};
+global.document = {{ querySelector() {{ return null; }} }};
+global.window = global;
+window.webkit = {{ messageHandlers: {{
+  omarchyTracks: {{ postMessage() {{}} }},
+  omarchyPlayback: {{ postMessage(value) {{ playback.push(JSON.parse(value)); }} }}
+}} }};
+window.fetch = async function(input) {{
+  const url = typeof input === 'string' ? input : input.url;
+  calls.push(url);
+  let payload;
+  if (url.includes('/tracks?')) payload = [{{
+    kind: 'track', id: 777, urn: 'soundcloud:tracks:777',
+    permalink_url: 'https://soundcloud.com/a/direct', title: 'Direct', duration: 3000,
+    user: {{ username: 'A' }}, media: {{ transcodings: [{{
+      url: 'https://api-v2.soundcloud.com/media/direct',
+      format: {{ protocol: 'progressive', mime_type: 'audio/mpeg' }}
+    }}] }}
+  }}];
+  else if (url.includes('/media/direct')) payload = {{ url: 'https://cf-media.sndcdn.com/direct.mp3?token=private' }};
+  else payload = {{ collection: [], next_href: null }};
+  const body = JSON.stringify(payload);
+  return new Response(body, {{ status: 200 }});
+}};
+global.XMLHttpRequest = function() {{}};
+XMLHttpRequest.prototype.open = function() {{}};
+XMLHttpRequest.prototype.setRequestHeader = function() {{}};
+XMLHttpRequest.prototype.send = function() {{}};
+XMLHttpRequest.prototype.addEventListener = function() {{}};
+eval({json.dumps(capture_script)});
+(async () => {{
+  await window.fetch(new Request('https://api-v2.soundcloud.com/stream?client_id=public-test', {{ headers: {{ authorization: 'OAuth private-test-value' }} }}));
+  await new Promise(setImmediate);
+  const accepted = window.__omarchyPlayApiTrack('soundcloud:tracks:777', 42);
+  for (let index = 0; index < 8; index++) await new Promise(setImmediate);
+  const safePlayback = playback.map(({{ streamUrl, ...message }}) => message);
+  process.stdout.write(JSON.stringify({{ accepted, calls, playback: safePlayback }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+        completed = subprocess.run(
+            ["node", "-e", harness], check=True, capture_output=True, text=True
+        )
+        result = json.loads(completed.stdout)
+
+        self.assertTrue(result["accepted"])
+        self.assertIn("/tracks?", result["calls"][1])
+        self.assertEqual(result["playback"][0]["track"]["playbackId"], "soundcloud:tracks:777")
+        self.assertEqual(result["playback"][0]["requestId"], 42)
+        self.assertTrue(result["playback"][0]["ok"])
+        self.assertNotIn("private-test-value", completed.stdout)
+
+    def test_late_resolution_cannot_replace_a_newer_track_selection(self):
+        app = load_module()
+        capture_script = app.api_request_capture_script()
+        harness = f"""
+const playback = [];
+let finishA;
+global.location = {{ href: 'https://soundcloud.com/feed', hostname: 'soundcloud.com', pathname: '/feed' }};
+global.document = {{ querySelector() {{ return null; }} }};
+global.window = global;
+window.webkit = {{ messageHandlers: {{
+  omarchyTracks: {{ postMessage() {{}} }},
+  omarchyPlayback: {{ postMessage(value) {{ playback.push(JSON.parse(value)); }} }}
+}} }};
+const response = (payload) => {{
+  const body = JSON.stringify(payload);
+  return new Response(body, {{ status: 200 }});
+}};
+const track = (id, name) => ({{
+  kind: 'track', id, urn: 'soundcloud:tracks:' + id,
+  permalink_url: 'https://soundcloud.com/a/' + name.toLowerCase(), title: name,
+  duration: 1000, user: {{ username: 'A' }}, media: {{ transcodings: [{{
+    url: 'https://api-v2.soundcloud.com/media/' + name.toLowerCase(),
+    format: {{ protocol: 'progressive', mime_type: 'audio/mpeg' }}
+  }}] }}
+}});
+window.fetch = async function(input) {{
+  const url = typeof input === 'string' ? input : input.url;
+  if (url.includes('/media/a')) return await new Promise((resolve) => {{
+    finishA = () => resolve(response({{ url: 'https://cf-media.sndcdn.com/a.mp3?token=private' }}));
+  }});
+  if (url.includes('/media/b')) return response({{ url: 'https://cf-media.sndcdn.com/b.mp3?token=private' }});
+  return response({{ collection: [track(1, 'A'), track(2, 'B')], next_href: null }});
+}};
+global.XMLHttpRequest = function() {{}};
+XMLHttpRequest.prototype.open = function() {{}};
+XMLHttpRequest.prototype.setRequestHeader = function() {{}};
+XMLHttpRequest.prototype.send = function() {{}};
+XMLHttpRequest.prototype.addEventListener = function() {{}};
+eval({json.dumps(capture_script)});
+(async () => {{
+  await window.fetch(new Request('https://api-v2.soundcloud.com/stream?client_id=public-test'));
+  await new Promise(setImmediate);
+  window.__omarchyPlayApiTrack('soundcloud:tracks:1', 1);
+  await new Promise(setImmediate);
+  window.__omarchyPlayApiTrack('soundcloud:tracks:2', 2);
+  for (let index = 0; index < 4; index++) await new Promise(setImmediate);
+  finishA();
+  for (let index = 0; index < 4; index++) await new Promise(setImmediate);
+  process.stdout.write(JSON.stringify(playback.map(({{ streamUrl, ...message }}) => message)));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+        completed = subprocess.run(
+            ["node", "-e", harness], check=True, capture_output=True, text=True
+        )
+        result = json.loads(completed.stdout)
+
+        self.assertEqual([message["requestId"] for message in result], [2])
+        self.assertEqual(result[0]["track"]["title"], "B")
+        self.assertNotIn("token=private", completed.stdout)
 
     def test_injected_track_scripts_do_not_extract_or_replay_frontend_credentials(self):
         source = MODULE_PATH.read_text()
 
         self.assertNotIn("def tracks_script", source)
         self.assertNotIn("__omarchyMetadataResources", source)
-        self.assertNotIn("searchParams.get('client_id')", source)
+        self.assertNotIn("window.latestRequestContext", source)
         self.assertNotIn("api-v2.soundcloud.com/resolve", source)
 
     def test_track_metadata_counts_and_duration_are_bounded(self):
         app = load_module()
         payload = {
             "tracks": [{
+                "playbackId": "soundcloud:tracks:123",
                 "title": "Track",
                 "artist": "Artist",
                 "url": "https://soundcloud.com/artist/track",
@@ -674,6 +1244,7 @@ eval({json.dumps(capture_script)});
 
         track = app.validate_tracks_payload(payload)["tracks"][0]
 
+        self.assertEqual("soundcloud:tracks:123", track["playbackId"])
         self.assertEqual(123456, track["playCount"])
         self.assertEqual(245000, track["durationMs"])
         payload["tracks"][0]["playCount"] = "123456"
@@ -722,22 +1293,23 @@ eval({json.dumps(capture_script)});
         self.assertIsNone(app._decode_chunked_body(b"11\r\ntoo-large-for-cap\r\n0\r\n\r\n", 8))
         self.assertIsNone(app._decode_chunked_body(b"4\r\nWiki", 16))
 
-    def test_play_track_script_clicks_existing_soundcloud_card(self):
+    def test_play_track_script_uses_only_stable_playback_id(self):
         app = load_module()
 
-        script = app.play_track_script("https://soundcloud.com/artist/track")
+        script = app.play_track_script("soundcloud:tracks:123", 17)
 
-        self.assertIn("https://soundcloud.com/artist/track", script)
-        self.assertIn("playableTile", script)
-        self.assertIn("playButton", script)
-        self.assertIn("button.click()", script)
-        self.assertIn("setTimeout", script)
-        self.assertIn("playControls__play", script)
+        self.assertIn("soundcloud:tracks:123", script)
+        self.assertIn("__omarchyPlayApiTrack(playbackId, 17)", script)
+        self.assertIn("__omarchyPlayApiTrack", script)
+        self.assertNotIn("document.querySelector", script)
+        self.assertNotIn("button.click()", script)
 
-    def test_play_track_script_rejects_non_soundcloud_url(self):
+    def test_play_track_script_rejects_invalid_playback_id(self):
         app = load_module()
 
-        self.assertIsNone(app.play_track_script("https://example.com/track"))
+        self.assertIsNone(app.play_track_script("https://soundcloud.com/artist/track", 1))
+        self.assertIsNone(app.play_track_script("soundcloud:tracks:not-a-number", 1))
+        self.assertIsNone(app.play_track_script("soundcloud:tracks:123", -1))
 
     def test_remote_payloads_are_schema_bounded_before_ipc(self):
         app = load_module()
@@ -791,6 +1363,8 @@ class CheckResultTest(unittest.TestCase):
         self.assertEqual(result["gtk"], "3.0")
         self.assertEqual(result["webkit2"], "4.1")
         self.assertEqual(result["gstreamer_autoaudiosink"], True)
+        self.assertEqual(result["gstreamer_aac_decoder"], True)
+        self.assertEqual(result["gstreamer_playback_elements"], True)
         self.assertIn("ok", result)
 
 
@@ -905,7 +1479,9 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn('text: "Home"', qml)
         self.assertIn('text: "Feed"', qml)
         self.assertIn("ListView {", qml)
-        self.assertIn('root.runAction("play-url"', qml)
+        self.assertIn('root.runAction("play"', qml)
+        self.assertIn("modelData.playbackId", qml)
+        self.assertNotIn('root.runAction("play-url"', qml)
 
     def test_track_selection_avoids_transient_signed_out_and_optimistic_metadata(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
@@ -913,7 +1489,12 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn("reportsLoggedOut", qml)
         self.assertIn("root.loggedIn && !reportsLoggedOut", qml)
         self.assertNotIn('root.title = track.title || ""', qml)
-        self.assertIn("enabled: !root.actionBusy", qml)
+        self.assertIn("(!root.actionBusy || root.selectionBusy)", qml)
+        self.assertIn('selectionBusy = action === "play"', qml)
+        self.assertIn("activeSelectionRequestId = sentId", qml)
+        self.assertIn("isCurrentSelectionResponse(activeSelectionRequestId, message.id)", qml)
+        self.assertIn("SoundCloudModel.selectionIsPending(playbackState)", qml)
+        self.assertIn('kind === "selection"', qml)
 
     def test_tab_loading_preserves_now_playing_state_and_each_tab_cache(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
@@ -987,7 +1568,7 @@ class BarWidgetTest(unittest.TestCase):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
 
         self.assertIn("var preserveMetadata", qml)
-        self.assertIn("soundcloud\\.com\\/(discover|feed)", qml)
+        self.assertIn("SoundCloudModel.shouldPreservePlaybackMetadata(state, root.title)", qml)
         self.assertLess(qml.index("playing = state.playing === true"), qml.index(
             "if (!preserveMetadata)"
         ))

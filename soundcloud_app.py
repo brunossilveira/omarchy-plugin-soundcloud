@@ -32,8 +32,9 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
-from urllib.parse import urlparse, urlunparse
+from typing import Mapping, cast
+from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 APP_ID = "com.github.brunosilveira.OmarchySoundCloud"
 APP_NAME = "SoundCloud"
@@ -61,6 +62,8 @@ MAX_EVENT_LOG_BYTES = 512 * 1024
 CLIENT_TIMEOUT_SECONDS = 5.0
 CLIENT_IDLE_SECONDS = 60.0
 SEND_TIMEOUT_SECONDS = 0.1
+HLS_MAX_WORKERS = 2
+HLS_OPERATION_SECONDS = 45.0
 ARTWORK_HOSTS = {"i1.sndcdn.com"}
 SOUNDCLOUD_WEB_HOSTS = {
     "soundcloud.com",
@@ -527,6 +530,10 @@ def is_soundcloud_uri(uri: str) -> bool:
     return host in SOUNDCLOUD_WEB_HOSTS
 
 
+def is_playback_id(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"soundcloud:tracks:[1-9][0-9]*", value) is not None
+
+
 def is_allowed_artwork_uri(uri: str) -> bool:
     try:
         parsed = urlparse(uri)
@@ -595,6 +602,13 @@ def load_more_source_from_command(command: str) -> str | None:
     }.get(command)
 
 
+def playback_id_from_command(command: str) -> str | None:
+    if not command.startswith("play:"):
+        return None
+    value = command.removeprefix("play:")
+    return value if is_playback_id(value) else None
+
+
 def merge_track_pages(
     existing: list[dict[str, object]],
     incoming: list[dict[str, object]],
@@ -654,7 +668,44 @@ def api_request_capture_script() -> str:
       const publishedSources = new Set();
       const pagination = Object.create(null);
       const xhrRequests = new WeakMap();
-      const normalise = (payload) => {
+      const playbackTracks = new Map();
+      let playbackGeneration = 0;
+      let latestRequestContext = null;
+      const routeGenerations = Object.create(null);
+      const nextRouteGeneration = (path) => {
+        const source = path === '/stream' ? 'feed' : 'home';
+        routeGenerations[source] = (routeGenerations[source] || 0) + 1;
+        return routeGenerations[source];
+      };
+      const boundedText = async (response, maximum) => {
+        const declared = Number(response.headers && response.headers.get('content-length'));
+        if (Number.isFinite(declared) && declared > maximum) throw new Error('response too large');
+        if (!response.body || typeof response.body.getReader !== 'function')
+          throw new Error('response body unavailable');
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8', { fatal: true });
+        let total = 0;
+        let text = '';
+        try {
+          while (true) {
+            const part = await reader.read();
+            if (part.done) break;
+            if (!(part.value instanceof Uint8Array)) throw new Error('invalid response body');
+            total += part.value.byteLength;
+            if (total > maximum) {
+              await reader.cancel();
+              throw new Error('response too large');
+            }
+            text += decoder.decode(part.value, { stream: true });
+          }
+          text += decoder.decode();
+          return text;
+        } catch (error) {
+          try { await reader.cancel(); } catch (_) {}
+          throw error;
+        }
+      };
+      const normalise = (payload, context, playbackTarget = playbackTracks) => {
         const queue = [[payload, 0]];
         const seenObjects = new Set();
         const seenTracks = new Set();
@@ -668,19 +719,69 @@ def api_request_capture_script() -> str:
           seenObjects.add(value);
           const permalink = typeof value.permalink_url === 'string' ? value.permalink_url : '';
           const title = typeof value.title === 'string' ? value.title.trim().slice(0, 512) : '';
-          if (permalink && title && typeof value.duration === 'number' && !seenTracks.has(permalink)) {
+          if ((value.kind === undefined || value.kind === 'track') && permalink && title
+              && typeof value.duration === 'number' && !seenTracks.has(permalink)) {
             seenTracks.add(permalink);
             const user = value.user && typeof value.user === 'object' ? value.user : {};
             const publisher = value.publisher_metadata && typeof value.publisher_metadata === 'object'
               ? value.publisher_metadata : {};
-            tracks.push({
+            const track = {
               title,
               artist: String(user.username || user.full_name || publisher.artist || '').slice(0, 256),
               url: permalink.slice(0, 2048),
               artUrl: String(value.artwork_url || user.avatar_url || '').slice(0, 2048),
               playCount: Number.isSafeInteger(value.playback_count) ? value.playback_count : 0,
               durationMs: Number.isSafeInteger(value.duration) ? value.duration : 0
-            });
+            };
+            tracks.push(track);
+            const transcodings = value.media && Array.isArray(value.media.transcodings)
+              ? value.media.transcodings : [];
+            const playable = transcodings
+              .filter((item) => item && item.format && typeof item.url === 'string'
+                && item.url.length <= 4096
+                && ['hls', 'progressive'].includes(item.format.protocol))
+              .sort((left, right) => {
+                const score = (item) => item.format.protocol === 'progressive' ? 0
+                  : item.format.mime_type === 'audio/mpeg' ? 1 : 2;
+                return score(left) - score(right);
+              })[0];
+            if (context && context.headers instanceof Headers) {
+              try {
+                const urn = typeof value.urn === 'string'
+                    && /^soundcloud:tracks:[0-9]+$/.test(value.urn)
+                  ? value.urn
+                  : (Number.isSafeInteger(value.id) && value.id > 0
+                    ? 'soundcloud:tracks:' + value.id : '');
+                const endpoint = playable ? new URL(playable.url)
+                  : (urn
+                    ? new URL('https://api.soundcloud.com/tracks/soundcloud:tracks:'
+                      + urn.substring('soundcloud:tracks:'.length) + '/streams') : null);
+                if (endpoint && !playable) {
+                  const clientId = context.headers.get('x-client-id')
+                    || context.headers.get('x-soundcloud-client-id');
+                  if (clientId) endpoint.searchParams.set('client_id', clientId);
+                }
+                if (endpoint.protocol === 'https:'
+                    && ['api-v2.soundcloud.com', 'api.soundcloud.com'].includes(endpoint.hostname)
+                    && !endpoint.port && !endpoint.username && !endpoint.password
+                    && (endpoint.pathname.startsWith('/media/')
+                      || /^\/tracks\/soundcloud:tracks:[0-9]+\/streams$/.test(endpoint.pathname))) {
+                  track.playbackId = urn;
+                  if (playbackTarget.size >= 200 && !playbackTarget.has(urn)) {
+                    playbackTarget.delete(playbackTarget.keys().next().value);
+                  }
+                  playbackTarget.set(urn, {
+                    endpoint: endpoint.href,
+                    headers: new Headers(context.headers),
+                    credentials: context.credentials,
+                    protocol: playable ? playable.format.protocol : '',
+                    mimeType: playable ? playable.format.mime_type : '',
+                    streams: !playable,
+                    track
+                  });
+                }
+              } catch (_) {}
+            }
           }
           if (depth >= 8) continue;
           if (Array.isArray(value)) {
@@ -690,6 +791,53 @@ def api_request_capture_script() -> str:
           }
         }
         return tracks;
+      };
+      const homeTrackIds = (payload) => {
+        const ids = [];
+        const seen = new Set();
+        const selections = payload && Array.isArray(payload.collection) ? payload.collection : [];
+        for (const selection of selections.slice(0, 50)) {
+          const itemState = selection && selection.items && typeof selection.items === 'object'
+            ? selection.items : null;
+          const items = Array.isArray(itemState) ? itemState
+            : (itemState && Array.isArray(itemState.collection) ? itemState.collection : []);
+          for (const item of items.slice(0, 50)) {
+            const tracks = item && Array.isArray(item.tracks) ? item.tracks : [];
+            for (const track of tracks.slice(0, 100)) {
+              const id = track && Number.isSafeInteger(track.id) ? track.id : 0;
+              if (id > 0 && !seen.has(id)) {
+                seen.add(id);
+                ids.push(id);
+              }
+              if (ids.length >= 50) return ids;
+            }
+          }
+        }
+        return ids;
+      };
+      const homeTracks = async (payload, context, playbackTarget = playbackTracks) => {
+        const embedded = normalise(payload, context, playbackTarget);
+        const ids = homeTrackIds(payload);
+        if (!ids.length || !context || !(context.headers instanceof Headers)) return embedded;
+        const request = new URL(context.requestUrl);
+        if (request.protocol !== 'https:' || request.hostname !== 'api-v2.soundcloud.com'
+            || request.port || request.username || request.password) return embedded;
+        const clientId = request.searchParams.get('client_id');
+        request.pathname = '/tracks';
+        request.search = '';
+        request.searchParams.set('ids', ids.join(','));
+        if (clientId) request.searchParams.set('client_id', clientId);
+        const response = await originalFetch(request.href, {
+          method: 'GET', headers: context.headers, credentials: context.credentials,
+          cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer'
+        });
+        if (!response.ok) throw new Error('home tracks unavailable');
+        const text = await boundedText(response, 2 * 1024 * 1024);
+        if (!text.length) throw new Error('invalid home tracks response');
+        const expanded = normalise(JSON.parse(text), context, playbackTarget);
+        const merged = new Map(embedded.map((track) => [track.url, track]));
+        for (const track of expanded) merged.set(track.url, track);
+        return Array.from(merged.values()).slice(0, 50);
       };
       const validNextUrl = (payload, path) => {
         try {
@@ -721,7 +869,8 @@ def api_request_capture_script() -> str:
           requestUrl: new URL(request ? request.url : input, location.href).href
         };
       };
-      const finishWithoutPage = (source, error, requestUrl) => {
+      const finishWithoutPage = (source, error, requestUrl, routeGeneration) => {
+        if (routeGeneration !== routeGenerations[source]) return;
         const state = pagination[source];
         if (state) {
           state.loading = false;
@@ -743,12 +892,22 @@ def api_request_capture_script() -> str:
           error: String(error || 'Could not load more tracks').slice(0, 128)
         }));
       };
-      const publish = (path, text, context) => {
+      const publish = async (path, text, context, routeGeneration) => {
         try {
           if (!(text.length > 0 && text.length <= 2 * 1024 * 1024)) throw new Error('invalid response');
           const payload = JSON.parse(text);
-          const tracks = normalise(payload);
+          const stagedPlayback = new Map();
+          const tracks = path === '/mixed-selections'
+            ? await homeTracks(payload, context, stagedPlayback)
+            : normalise(payload, context, stagedPlayback);
           const source = path === '/stream' ? 'feed' : 'home';
+          if (routeGeneration !== routeGenerations[source]) return;
+          for (const [urn, item] of stagedPlayback) {
+            if (playbackTracks.size >= 200 && !playbackTracks.has(urn)) {
+              playbackTracks.delete(playbackTracks.keys().next().value);
+            }
+            playbackTracks.set(urn, item);
+          }
           const reset = !publishedSources.has(source);
           publishedSources.add(source);
           const previous = !reset && cache[source] && Array.isArray(cache[source].tracks)
@@ -788,7 +947,8 @@ def api_request_capture_script() -> str:
             finishWithoutPage(
               path === '/stream' ? 'feed' : 'home',
               'Could not load more tracks',
-              context.requestUrl
+              context.requestUrl,
+              routeGeneration
             );
           }
         }
@@ -817,25 +977,127 @@ def api_request_capture_script() -> str:
         };
       };
       const originalFetch = window.fetch.bind(window);
+      window.__omarchyPlayApiTrack = function(value, requestId) {
+        const target = String(value || '');
+        if (!/^soundcloud:tracks:[0-9]+$/.test(target)
+            || !Number.isSafeInteger(requestId) || requestId < 0) return false;
+        const generation = ++playbackGeneration;
+        const pageAudio = document.querySelector('audio');
+        if (pageAudio && !pageAudio.paused) pageAudio.pause();
+        const loadItem = async () => {
+          let item = playbackTracks.get(target);
+          if (item) return item;
+          const waitDeadline = Date.now() + 30000;
+          while (!latestRequestContext && Date.now() < waitDeadline) {
+            if (generation !== playbackGeneration) throw new Error('selection superseded');
+            await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+          const id = target.substring('soundcloud:tracks:'.length);
+          const context = latestRequestContext;
+          if (!context) throw new Error('track context unavailable');
+          const request = new URL(context.requestUrl);
+          if (request.protocol !== 'https:' || request.hostname !== 'api-v2.soundcloud.com'
+              || request.port || request.username || request.password)
+            throw new Error('track context unavailable');
+          const clientId = request.searchParams.get('client_id');
+          request.pathname = '/tracks';
+          request.search = '';
+          request.searchParams.set('ids', id);
+          if (clientId) request.searchParams.set('client_id', clientId);
+          const response = await originalFetch(request.href, {
+            method: 'GET', headers: context.headers, credentials: context.credentials,
+            cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer'
+          });
+          if (!response.ok) throw new Error('track unavailable');
+          const text = await boundedText(response, 2 * 1024 * 1024);
+          if (!text.length) throw new Error('invalid track response');
+          normalise(JSON.parse(text), context);
+          item = playbackTracks.get(target);
+          if (!item) throw new Error('track unavailable');
+          return item;
+        };
+        loadItem().then((item) => originalFetch(item.endpoint, {
+          method: 'GET', headers: item.headers, credentials: item.credentials,
+          cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer'
+        }).then((response) => {
+          if (!response.ok) throw new Error('HTTP ' + response.status);
+          return boundedText(response, 16384);
+        }).then((text) => {
+          if (generation !== playbackGeneration) return;
+          if (!text || text.length > 16384) throw new Error('invalid stream response');
+          const payload = JSON.parse(text);
+          let resolved = String(payload.url || '');
+          let protocol = item.protocol;
+          let mimeType = item.mimeType;
+          if (item.streams) {
+            if (typeof payload.hls_aac_160_url === 'string') {
+              resolved = payload.hls_aac_160_url;
+              protocol = 'hls';
+              mimeType = 'audio/mp4';
+            } else if (typeof payload.hls_aac_96_url === 'string') {
+              resolved = payload.hls_aac_96_url;
+              protocol = 'hls';
+              mimeType = 'audio/mp4';
+            } else if (typeof payload.http_mp3_128_url === 'string') {
+              resolved = payload.http_mp3_128_url;
+              protocol = 'progressive';
+              mimeType = 'audio/mpeg';
+            } else if (typeof payload.hls_mp3_128_url === 'string') {
+              resolved = payload.hls_mp3_128_url;
+              protocol = 'hls';
+              mimeType = 'audio/mpeg';
+            }
+          }
+          const stream = new URL(resolved);
+          const host = stream.hostname.toLowerCase();
+          if (stream.protocol !== 'https:' || stream.port || stream.username || stream.password
+              || !(host.endsWith('.sndcdn.com') || host.endsWith('.soundcloud.cloud')))
+            throw new Error('invalid stream URL');
+          window.webkit.messageHandlers.omarchyPlayback.postMessage(JSON.stringify({
+            ok: true,
+            requestId,
+            streamUrl: stream.href,
+            protocol,
+            mimeType,
+            track: item.track
+          }));
+        })).catch((error) => {
+          if (generation !== playbackGeneration) return;
+          const detail = /^HTTP [0-9]{3}$/.test(String(error && error.message || ''))
+            ? ' (' + error.message + ')' : '';
+          window.webkit.messageHandlers.omarchyPlayback.postMessage(JSON.stringify({
+            ok: false,
+            requestId,
+            error: 'SoundCloud could not resolve this track' + detail
+          }));
+        });
+        return true;
+      };
+      window.__omarchyPlaybackTrackCount = () => playbackTracks.size;
       window.fetch = function(input, init) {
         const path = routeFor(input);
         const context = path ? requestContext(input, init) : null;
+        const routeGeneration = path ? nextRouteGeneration(path) : 0;
+        if (context) latestRequestContext = context;
         markLoading(path);
         return originalFetch(input, init).then((response) => {
           if (path && response.ok) {
-            response.clone().text()
-              .then((text) => publish(path, text, context))
+            boundedText(response.clone(), 2 * 1024 * 1024)
+              .then((text) => publish(path, text, context, routeGeneration))
               .catch(() => {
+                if (routeGeneration !== routeGenerations[path === '/stream' ? 'feed' : 'home']) return;
                 const current = cache[path === '/stream' ? 'feed' : 'home'];
                 if (current) current.loading = false;
               });
           } else if (path) {
+            if (routeGeneration !== routeGenerations[path === '/stream' ? 'feed' : 'home']) return response;
             const current = cache[path === '/stream' ? 'feed' : 'home'];
             if (current) current.loading = false;
           }
           return response;
         }).catch((error) => {
           if (path) {
+            if (routeGeneration !== routeGenerations[path === '/stream' ? 'feed' : 'home']) throw error;
             const current = cache[path === '/stream' ? 'feed' : 'home'];
             if (current) current.loading = false;
           }
@@ -867,11 +1129,15 @@ def api_request_capture_script() -> str:
       XMLHttpRequest.prototype.send = function() {
         const context = xhrRequests.get(this) || { path: '', headers: new Headers(), credentials: 'omit' };
         const path = context.path;
+        const routeGeneration = path ? nextRouteGeneration(path) : 0;
+        if (path) latestRequestContext = context;
         markLoading(path);
         if (path) this.addEventListener('load', function() {
           if (this.status >= 200 && this.status < 300
               && (!this.responseType || this.responseType === 'text')) {
-            publish(path, String(this.responseText || ''), context);
+            const text = this.responseText;
+            if (typeof text === 'string' && text.length <= 2 * 1024 * 1024)
+              publish(path, text, context, routeGeneration);
           } else {
             const current = cache[path === '/stream' ? 'feed' : 'home'];
             if (current) current.loading = false;
@@ -904,19 +1170,22 @@ def api_request_capture_script() -> str:
         state.loading = true;
         state.lastRequested = requestUrl;
         markLoading(expectedPath);
+        const routeGeneration = nextRouteGeneration(expectedPath);
         originalFetch(requestUrl, {
           method: 'GET',
           headers: state.headers,
           credentials: state.credentials
         }).then((response) => {
           if (!response.ok) throw new Error('HTTP ' + response.status);
-          return response.text();
+          return boundedText(response, 2 * 1024 * 1024);
         }).then((text) => publish(expectedPath, text, {
           headers: state.headers,
           credentials: state.credentials,
           requestUrl,
           seen
-        })).catch(() => finishWithoutPage(source, 'Could not load more tracks', requestUrl));
+        }, routeGeneration)).catch(() => finishWithoutPage(
+          source, 'Could not load more tracks', requestUrl, routeGeneration
+        ));
         return { started: true, hasMore: true };
       };
     })()"""
@@ -945,60 +1214,31 @@ def api_observation_script() -> str:
           error: String(state.error || '').slice(0, 128)
         };
       }
-      return { paths: paths.slice(0, 32), lists };
+      return {
+        paths: paths.slice(0, 32),
+        lists,
+        playbackCount: typeof window.__omarchyPlaybackTrackCount === 'function'
+          ? Number(window.__omarchyPlaybackTrackCount()) : 0
+      };
     })()"""
 
 
-def play_track_script(track_url: str) -> str | None:
-    if not is_soundcloud_uri(track_url):
+def play_track_script(playback_id: str, request_id: int) -> str | None:
+    if (not is_playback_id(playback_id) or isinstance(request_id, bool)
+            or not isinstance(request_id, int) or not 0 <= request_id <= 2**31 - 1):
         return None
-    target = json.dumps(track_url)
+    target = json.dumps(playback_id)
     return rf"""(() => {{
-      const target = new URL({target}, location.href).href;
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
-      let link = null;
-      let candidate;
-      let scanned = 0;
-      while (scanned++ < 10000 && (candidate = walker.nextNode())) {{
-        if (!candidate.matches('a[href]')) continue;
-        try {{
-          if (new URL(candidate.href, location.href).href === target) {{ link = candidate; break; }}
-        }} catch (_) {{}}
-      }}
-      if (!link) return false;
-      const container = link.closest(
-        '.soundList__item, .stream__list .sound, .mixedSelectionModule__item, .playableTile, li, article'
-      );
-      if (!container) return false;
-      const button = container.querySelector(
-        '.playButton, .soundTitle__playButton, button[aria-label^="Play"], button[title^="Play"]'
-      );
-      if (!button) return false;
-      button.scrollIntoView({{ block: 'nearest', inline: 'nearest' }});
-      button.click();
-      let confirmedPlaying = false;
-      const ensurePlaying = () => {{
-        if (confirmedPlaying) return;
-        const activeLink = document.querySelector('.playbackSoundBadge__titleLink[href]');
-        if (!activeLink || new URL(activeLink.href, location.href).href !== target) return;
-        const globalPlay = document.querySelector('.playControls__play, .playControl');
-        if (!globalPlay) return;
-        const saysPause = globalPlay.classList.contains('playing') ||
-          /Pause/i.test(globalPlay.getAttribute('title') || '') ||
-          /Pause/i.test(globalPlay.getAttribute('aria-label') || '');
-        if (saysPause) {{ confirmedPlaying = true; return; }}
-        globalPlay.click();
-      }};
-      setTimeout(ensurePlaying, 180);
-      setTimeout(ensurePlaying, 500);
-      setTimeout(ensurePlaying, 900);
-      return true;
+      const playbackId = {target};
+      return typeof window.__omarchyPlayApiTrack === 'function'
+        && window.__omarchyPlayApiTrack(playbackId, {request_id});
     }})()"""
 
 
 def status_script() -> str:
     return r"""(() => {
       const audio = document.querySelector('audio');
+      const playerPresent = !!audio;
       const playControl = document.querySelector('.playControls__play, .playControl');
       const controlSaysPause = !!playControl && (
         playControl.classList.contains('playing') ||
@@ -1040,15 +1280,18 @@ def status_script() -> str:
         if (match) { artUrl = match[1].slice(0, 2048); break; }
       }
       return {
-        playing: controlSaysPause || (!!audio && !audio.paused),
-        title: text('.playbackSoundBadge__titleLink span[aria-hidden="true"]', '.playbackSoundBadge__titleLink'),
-        artist: text('.playbackSoundBadge__lightLink', '.playbackSoundBadge__titleContextContainer a'),
-        artUrl,
+        playerPresent,
+        playing: playerPresent ? !audio.paused : false,
+        title: playerPresent
+          ? text('.playbackSoundBadge__titleLink span[aria-hidden="true"]', '.playbackSoundBadge__titleLink') : '',
+        artist: playerPresent
+          ? text('.playbackSoundBadge__lightLink', '.playbackSoundBadge__titleContextContainer a') : '',
+        artUrl: playerPresent ? artUrl : '',
         loggedIn: !/^\/(signin|register)/.test(location.pathname) &&
           !!document.querySelector('.header__userNavButton, a[href*="/you/library"]'),
         url: location.href,
-        duration: audio && isFinite(audio.duration) ? audio.duration : timelineDuration,
-        position: audio && isFinite(audio.currentTime) ? audio.currentTime : timelinePosition
+        duration: playerPresent && isFinite(audio.duration) ? audio.duration : 0,
+        position: playerPresent && isFinite(audio.currentTime) ? audio.currentTime : 0
       };
     })()"""
 
@@ -1083,13 +1326,24 @@ def validate_status_payload(payload: object) -> dict[str, object] | None:
     art_url = _bounded_string(payload.get("artUrl", ""), MAX_URL_BYTES)
     duration = _finite_number(payload.get("duration", 0), 0, 60 * 60 * 24 * 7)
     position = _finite_number(payload.get("position", 0), 0, 60 * 60 * 24 * 7)
-    if None in (title, artist, page_url, art_url, duration, position):
+    error = _bounded_string(payload.get("error", ""), 128)
+    player_present = payload.get("playerPresent", True)
+    playback_state = payload.get("playbackState")
+    if playback_state is None:
+        playback_state = "playing" if payload.get("playing") is True else (
+            "paused" if player_present is True else "idle"
+        )
+    if (None in (title, artist, page_url, art_url, duration, position, error)
+            or not isinstance(player_present, bool)
+            or playback_state not in {"idle", "resolving", "buffering", "playing", "paused", "error"}):
         return None
     if page_url and not is_soundcloud_uri(page_url):
         return None
     if art_url and not is_allowed_artwork_uri(art_url):
         art_url = ""
     return {
+        "playerPresent": player_present,
+        "playbackState": playback_state,
         "playing": payload.get("playing") is True,
         "title": title,
         "artist": artist,
@@ -1098,6 +1352,7 @@ def validate_status_payload(payload: object) -> dict[str, object] | None:
         "url": page_url,
         "duration": duration,
         "position": min(position, duration) if duration else position,
+        **({"error": error} if error else {}),
     }
 
 
@@ -1115,12 +1370,16 @@ def validate_tracks_payload(payload: object) -> dict[str, object] | None:
         artist = _bounded_string(item.get("artist", ""), MAX_ARTIST_BYTES)
         track_url = _bounded_string(item.get("url", ""), MAX_URL_BYTES)
         art_url = _bounded_string(item.get("artUrl", ""), MAX_URL_BYTES)
-        if None in (title, artist, track_url, art_url) or not title or not is_soundcloud_uri(track_url):
+        playback_id = _bounded_string(item.get("playbackId", ""), 64)
+        if (None in (title, artist, track_url, art_url, playback_id)
+                or not title or not isinstance(track_url, str) or not is_soundcloud_uri(track_url)
+                or (playback_id and not is_playback_id(playback_id))):
             return None
         if art_url and not is_allowed_artwork_uri(art_url):
             art_url = ""
         tracks.append(
             {
+                "playbackId": playback_id,
                 "title": title,
                 "artist": artist,
                 "url": track_url,
@@ -1520,6 +1779,8 @@ def dependency_check() -> dict[str, object]:
         "gtk": "3.0",
         "webkit2": "4.1",
         "gstreamer_autoaudiosink": False,
+        "gstreamer_aac_decoder": False,
+        "gstreamer_playback_elements": False,
         "ok": False,
     }
     try:
@@ -1535,9 +1796,26 @@ def dependency_check() -> dict[str, object]:
         result["gstreamer_autoaudiosink"] = bool(
             Gst.ElementFactory.find("autoaudiosink")
         )
+        result["gstreamer_aac_decoder"] = bool(Gst.ElementFactory.find("avdec_aac"))
+        required_elements = (
+            "playbin3", "appsrc", "mpegaudioparse", "mpg123audiodec",
+            "audioconvert", "audioresample", "autoaudiosink", "hlsdemux2", "souphttpsrc",
+        )
+        missing_elements = [
+            name for name in required_elements if not Gst.ElementFactory.find(name)
+        ]
+        result["gstreamer_playback_elements"] = not missing_elements
         if not result["gstreamer_autoaudiosink"]:
             result["error"] = "GStreamer autoaudiosink is missing; install gst-plugins-good"
-        result["ok"] = bool(result["gstreamer_autoaudiosink"])
+        elif not result["gstreamer_aac_decoder"]:
+            result["error"] = "GStreamer AAC decoder is missing; install gst-libav"
+        elif missing_elements:
+            result["error"] = "Missing GStreamer elements: " + ", ".join(missing_elements)
+        result["ok"] = bool(
+            result["gstreamer_autoaudiosink"]
+            and result["gstreamer_aac_decoder"]
+            and result["gstreamer_playback_elements"]
+        )
     except (ImportError, ValueError) as exc:
         result["error"] = str(exc)
     return result
@@ -1546,12 +1824,386 @@ def dependency_check() -> dict[str, object]:
 def _load_gi():
     import gi
 
+    gi.require_version("Gst", "1.0")
     gi.require_version("Gtk", "3.0")
     gi.require_version("Soup", "3.0")
     gi.require_version("WebKit2", "4.1")
-    from gi.repository import Gio, GLib, Gtk, Soup, WebKit2
+    from gi.repository import Gio, GLib, Gst, Gtk, Soup, WebKit2
 
-    return Gio, GLib, Gtk, Soup, WebKit2
+    return Gio, GLib, Gst, Gtk, Soup, WebKit2
+
+
+def validate_stream_uri(uri: object) -> str | None:
+    value = _bounded_string(uri, 8192)
+    if value is None:
+        return None
+    try:
+        parsed = urlparse(value)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+    ):
+        return None
+    host = parsed.hostname.lower().rstrip(".")
+    if not (host.endswith(".sndcdn.com") or host.endswith(".soundcloud.cloud")):
+        return None
+    return value
+
+
+class _NoMediaRedirect(HTTPRedirectHandler):
+    def redirect_request(self, _req, _fp, _code, _msg, _headers, _newurl):
+        return None
+
+
+_media_opener = build_opener(ProxyHandler({}), _NoMediaRedirect)
+
+
+def _set_media_response_timeout(response, timeout: float) -> None:
+    candidates = (
+        getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None),
+        getattr(getattr(response, "fp", None), "_sock", None),
+    )
+    for candidate in candidates:
+        if candidate is not None and hasattr(candidate, "settimeout"):
+            candidate.settimeout(timeout)
+            return
+
+
+def fetch_private_media(
+    uri: str,
+    maximum: int,
+    *,
+    deadline: float | None = None,
+    cancelled=lambda: False,
+) -> bytes:
+    if cancelled():
+        raise concurrent.futures.CancelledError
+    remaining = 15.0 if deadline is None else deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("media operation deadline exceeded")
+    validated = validate_stream_uri(uri)
+    if validated is None:
+        raise ValueError("invalid media URL")
+    request = Request(validated, headers={"User-Agent": "Mozilla/5.0"})
+    with _media_opener.open(request, timeout=min(15.0, remaining)) as response:
+        if cancelled():
+            raise concurrent.futures.CancelledError
+        if validate_stream_uri(response.geturl()) is None:
+            raise ValueError("invalid media response URL")
+        length = response.headers.get("Content-Length")
+        if length and int(length) > maximum:
+            raise ValueError("media response too large")
+        data = bytearray()
+        while len(data) <= maximum:
+            if cancelled():
+                raise concurrent.futures.CancelledError
+            remaining = 15.0 if deadline is None else deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("media operation deadline exceeded")
+            _set_media_response_timeout(response, min(15.0, remaining))
+            read = getattr(response, "read1", None)
+            chunk_size = min(64 * 1024, maximum + 1 - len(data))
+            part = cast(
+                bytes,
+                read(chunk_size) if callable(read) else response.read(min(1, chunk_size)),
+            )
+            if not part:
+                break
+            data.extend(part)
+    if cancelled():
+        raise concurrent.futures.CancelledError
+    if deadline is not None and time.monotonic() > deadline:
+        raise TimeoutError("media operation deadline exceeded")
+    if len(data) > maximum:
+        raise ValueError("media response too large")
+    return bytes(data)
+
+
+def hls_segment_urls(
+    uri: str,
+    depth: int = 0,
+    *,
+    deadline: float | None = None,
+    cancelled=lambda: False,
+) -> list[str]:
+    if depth > 2:
+        raise ValueError("nested HLS playlist")
+    text = fetch_private_media(
+        uri, 512 * 1024, deadline=deadline, cancelled=cancelled
+    ).decode("utf-8")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    media_lines = [line for line in lines if not line.startswith("#")]
+    if not media_lines:
+        raise ValueError("empty HLS playlist")
+    resolved = [urljoin(uri, line) for line in media_lines]
+    if any(line.startswith("#EXT-X-STREAM-INF") for line in lines):
+        return hls_segment_urls(
+            resolved[0], depth + 1, deadline=deadline, cancelled=cancelled
+        )
+    if len(resolved) > 4096 or any(validate_stream_uri(value) is None for value in resolved):
+        raise ValueError("invalid HLS segments")
+    return resolved
+
+
+class GstPlayback:
+    def __init__(self, Gst, on_change, schedule=lambda callback, *args: callback(*args)):
+        self.Gst = Gst
+        Gst.init(None)
+        self.current = None
+        self.on_change = on_change
+        self.schedule = schedule
+        self.active = False
+        self.playing = False
+        self.state = "idle"
+        self.has_started = False
+        self.metadata: dict[str, object] = {}
+        self.error = ""
+        self.generation = 0
+        self.bus_watches = {}
+        self.hls_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=HLS_MAX_WORKERS,
+            thread_name_prefix="soundcloud-hls",
+        )
+        self.hls_slots = threading.BoundedSemaphore(HLS_MAX_WORKERS)
+
+    def _watch_bus(self, pipeline, generation: int) -> None:
+        bus = pipeline.get_bus()
+        bus.add_signal_watch()
+        handler = bus.connect("message", self._message, pipeline, generation)
+        self.bus_watches[id(pipeline)] = (bus, handler)
+
+    def _message(self, _bus, message, pipeline, generation):
+        if pipeline is not self.current or generation != self.generation:
+            return
+        if message.type == self.Gst.MessageType.ERROR:
+            self.stop("SoundCloud could not play this track")
+        elif message.type == self.Gst.MessageType.EOS:
+            self.playing = False
+            self.state = "paused"
+            self.on_change()
+        elif message.type == self.Gst.MessageType.STATE_CHANGED and message.src == self.current:
+            _old, current, _pending = message.parse_state_changed()
+            self.playing = current == self.Gst.State.PLAYING
+            if self.playing:
+                self.has_started = True
+                self.state = "playing"
+            elif current == self.Gst.State.PAUSED:
+                self.state = "paused" if self.has_started else "buffering"
+            self.on_change()
+
+    def _stop_current(self) -> None:
+        self.generation += 1
+        previous = self.current
+        self.current = None
+        if previous is None:
+            return
+        watch = self.bus_watches.pop(id(previous), None)
+        if watch:
+            bus, handler = watch
+            bus.disconnect(handler)
+            bus.remove_signal_watch()
+        previous.set_state(self.Gst.State.NULL)
+
+    def stop(self, error: str = "") -> None:
+        self._stop_current()
+        self.active = False
+        self.playing = False
+        self.has_started = False
+        self.metadata = {}
+        self.error = error[:128]
+        self.state = "error" if self.error else "idle"
+        self.on_change()
+
+    def begin(self, metadata: dict[str, object]) -> int:
+        self._stop_current()
+        self.active = False
+        self.playing = False
+        self.has_started = False
+        self.metadata = dict(metadata)
+        self.error = ""
+        self.state = "resolving"
+        self.on_change()
+        return self.generation
+
+    def play(
+        self,
+        uri: str,
+        metadata: dict[str, object],
+        protocol: str = "",
+        mime_type: str = "",
+    ) -> bool:
+        self.metadata = dict(metadata)
+        self.error = ""
+        self.active = True
+        self.playing = False
+        self.has_started = False
+        self.state = "buffering"
+        if protocol == "hls" and mime_type == "audio/mpeg":
+            return self._play_hls(uri)
+        pipeline = self.Gst.ElementFactory.make(
+            "playbin3", f"omarchy-soundcloud-player-{self.generation}"
+        )
+        if pipeline is None:
+            self.active = False
+            self.error = "SoundCloud could not initialize audio playback"
+            self.state = "error"
+            return False
+        self.current = pipeline
+        self._watch_bus(pipeline, self.generation)
+        pipeline.set_property("uri", uri)
+        result = pipeline.set_state(self.Gst.State.PLAYING)
+        if result == self.Gst.StateChangeReturn.FAILURE:
+            self._stop_current()
+            self.active = False
+            self.error = "SoundCloud could not play this track"
+            self.state = "error"
+            return False
+        return True
+
+    def _play_hls(self, uri: str) -> bool:
+        try:
+            pipeline = self.Gst.parse_launch(
+                "appsrc name=source format=time is-live=false block=true "
+                "caps=audio/mpeg,mpegversion=1,layer=3 ! mpegaudioparse ! "
+                "mpg123audiodec ! audioconvert ! audioresample ! autoaudiosink"
+            )
+        except Exception:
+            self.active = False
+            self.error = "SoundCloud could not initialize audio playback"
+            self.state = "error"
+            return False
+        source = pipeline.get_by_name("source")
+        if source is None:
+            self.active = False
+            self.error = "SoundCloud could not initialize audio playback"
+            self.state = "error"
+            return False
+        self.current = pipeline
+        self._watch_bus(pipeline, self.generation)
+        generation = self.generation
+        if pipeline.set_state(self.Gst.State.PLAYING) == self.Gst.StateChangeReturn.FAILURE:
+            self._stop_current()
+            self.active = False
+            self.error = "SoundCloud could not initialize audio playback"
+            self.state = "error"
+            return False
+        if not self.hls_slots.acquire(blocking=False):
+            self._stop_current()
+            self.active = False
+            self.error = "SoundCloud playback is busy"
+            self.state = "error"
+            return False
+        self.hls_executor.submit(
+            self._feed_hls_bounded,
+            generation,
+            source,
+            uri,
+            time.monotonic() + HLS_OPERATION_SECONDS,
+        )
+        return True
+
+    def _feed_hls_bounded(self, generation: int, source, uri: str, deadline: float) -> None:
+        try:
+            self._feed_hls(generation, source, uri, deadline)
+        finally:
+            self.hls_slots.release()
+
+    def _feed_hls(self, generation: int, source, uri: str, deadline: float) -> None:
+        try:
+            total_bytes = 0
+            cancelled = lambda: generation != self.generation
+            for segment in hls_segment_urls(uri, deadline=deadline, cancelled=cancelled):
+                if generation != self.generation:
+                    return
+                data = fetch_private_media(
+                    segment,
+                    4 * 1024 * 1024,
+                    deadline=deadline,
+                    cancelled=cancelled,
+                )
+                total_bytes += len(data)
+                if total_bytes > 128 * 1024 * 1024:
+                    raise ValueError("track stream too large")
+                buffer = self.Gst.Buffer.new_allocate(None, len(data), None)
+                buffer.fill(0, data)
+                if source.emit("push-buffer", buffer) != self.Gst.FlowReturn.OK:
+                    raise RuntimeError("audio pipeline rejected data")
+            if generation == self.generation:
+                source.emit("end-of-stream")
+        except (OSError, RuntimeError, TimeoutError, UnicodeError, ValueError,
+                concurrent.futures.CancelledError):
+            if generation == self.generation:
+                self.schedule(self._hls_failed, generation)
+
+    def _hls_failed(self, generation: int) -> bool:
+        if generation == self.generation:
+            self.stop("SoundCloud could not stream this track")
+        return False
+
+    def toggle(self) -> bool:
+        if not self.active:
+            return False
+        target = self.Gst.State.PAUSED if self.playing else self.Gst.State.PLAYING
+        return self.current.set_state(target) != self.Gst.StateChangeReturn.FAILURE
+
+    def seek(self, ratio: float) -> bool:
+        if not self.active:
+            return False
+        duration = self._query_time("query_duration")
+        if duration <= 0:
+            duration = float(self.metadata.get("durationMs", 0) or 0) / 1000
+        if duration <= 0:
+            return False
+        return bool(self.current.seek_simple(
+            self.Gst.Format.TIME,
+            self.Gst.SeekFlags.FLUSH | self.Gst.SeekFlags.KEY_UNIT,
+            int(duration * max(0.0, min(1.0, ratio)) * self.Gst.SECOND),
+        ))
+
+    def _query_time(self, method: str) -> float:
+        try:
+            ok, value = getattr(self.current, method)(self.Gst.Format.TIME)
+            return value / self.Gst.SECOND if ok and value >= 0 else 0.0
+        except (AttributeError, TypeError, ValueError):
+            return 0.0
+
+    def status(self) -> dict[str, object]:
+        if not self.active:
+            return {
+                "playerPresent": False,
+                "playbackState": self.state,
+                "playing": False,
+                "title": "",
+                "artist": "",
+                "artUrl": "",
+                "duration": 0.0,
+                "position": 0.0,
+                **({"error": self.error} if self.error else {}),
+            }
+        duration = self._query_time("query_duration")
+        if duration <= 0:
+            duration = float(self.metadata.get("durationMs", 0) or 0) / 1000
+        return {
+            "playerPresent": True,
+            "playbackState": self.state,
+            "playing": self.playing,
+            "title": str(self.metadata.get("title", "")),
+            "artist": str(self.metadata.get("artist", "")),
+            "artUrl": str(self.metadata.get("artUrl", "")),
+            "duration": duration,
+            "position": self._query_time("query_position"),
+            **({"error": self.error} if self.error else {}),
+        }
+
+    def close(self) -> None:
+        self._stop_current()
+        self.hls_executor.shutdown(wait=False, cancel_futures=True)
 
 
 class ClientConnection:
@@ -1796,7 +2448,7 @@ class ControlServer(threading.Thread):
 
 
 def build_application(show_on_start: bool = False):
-    Gio, GLib, Gtk, Soup, WebKit2 = _load_gi()
+    Gio, GLib, Gst, Gtk, Soup, WebKit2 = _load_gi()
     paths = profile_paths()
     prepare_profile_paths(paths)
     profile_fd = ensure_private_directory(paths.data_dir)
@@ -1822,6 +2474,11 @@ def build_application(show_on_start: bool = False):
             self.status_subscribers = StatusSubscribers()
             self.status_evaluation_pending = False
             self.artwork_cache = ArtworkCache()
+            self.playback = GstPlayback(
+                Gst,
+                lambda: GLib.idle_add(self._publish_status_once),
+                GLib.idle_add,
+            )
             self.list_artwork_cache = ArtworkCache(
                 maximum_entries=48,
                 maximum_pending=8,
@@ -1834,6 +2491,13 @@ def build_application(show_on_start: bool = False):
             )
             self.track_artwork_urls: OrderedDict[str, str] = OrderedDict()
             self.track_cache = track_cache
+            self.playback_tracks = {
+                track["playbackId"]: track
+                for tracks in track_cache.values()
+                for track in tracks
+                if is_playback_id(track.get("playbackId"))
+            }
+            self.selection_generation = 0
             self.track_cache_save_pending = False
             self.had_subscriber = False
             self.disconnect_generation = 0
@@ -1860,6 +2524,7 @@ def build_application(show_on_start: bool = False):
 
         def do_shutdown(self):
             self.control_server.close()
+            self.playback.close()
             self.artwork_cache.close()
             self.list_artwork_cache.close()
             os.close(profile_fd)
@@ -1889,9 +2554,15 @@ def build_application(show_on_start: bool = False):
             content_manager = self.webview.get_user_content_manager()
             if not content_manager.register_script_message_handler("omarchyTracks"):
                 raise RuntimeError("could not register SoundCloud track message handler")
+            if not content_manager.register_script_message_handler("omarchyPlayback"):
+                raise RuntimeError("could not register SoundCloud playback message handler")
             content_manager.connect(
                 "script-message-received::omarchyTracks",
                 self._tracks_message_received,
+            )
+            content_manager.connect(
+                "script-message-received::omarchyPlayback",
+                self._playback_message_received,
             )
             content_manager.add_script(WebKit2.UserScript.new(
                 api_request_capture_script(),
@@ -1950,6 +2621,12 @@ def build_application(show_on_start: bool = False):
                 incoming_tracks = page.get("tracks")
                 if not isinstance(incoming_tracks, list):
                     return
+                for track in incoming_tracks:
+                    playback_id = track.get("playbackId")
+                    if is_playback_id(playback_id):
+                        self.playback_tracks[playback_id] = track
+                while len(self.playback_tracks) > MAX_TRACKS * 2:
+                    self.playback_tracks.pop(next(iter(self.playback_tracks)))
                 existing_tracks = self.track_cache.get(source, [])
                 reset = payload.get("reset") is True
                 merged_tracks = merge_track_pages(
@@ -1994,6 +2671,53 @@ def build_application(show_on_start: bool = False):
                 if not self.track_cache_save_pending:
                     self.track_cache_save_pending = True
                     GLib.idle_add(self._save_track_cache)
+
+        def _playback_message_received(self, _manager, message):
+            try:
+                value = message.get_js_value()
+                encoded = value.to_json(0)
+                raw = json.loads(encoded)
+                if not isinstance(raw, str) or len(raw.encode("utf-8")) > 32768:
+                    return
+                payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    return
+                request_id = payload.get("requestId")
+                if (isinstance(request_id, bool) or not isinstance(request_id, int)
+                        or request_id != self.selection_generation):
+                    return
+                if payload.get("ok") is not True:
+                    self.playback.stop(
+                        _bounded_string(payload.get("error", ""), 128)
+                        or "SoundCloud could not resolve this track"
+                    )
+                    return
+                stream_uri = validate_stream_uri(payload.get("streamUrl"))
+                validated = validate_tracks_payload({"tracks": [payload.get("track")]})
+                validated_tracks = validated.get("tracks") if validated is not None else None
+                if (stream_uri is None or not isinstance(validated_tracks, list)
+                        or len(validated_tracks) != 1):
+                    self.playback.stop("SoundCloud returned invalid stream details")
+                    return
+                selected_track = validated_tracks[0]
+                if not isinstance(selected_track, dict):
+                    self.playback.stop("SoundCloud returned invalid track details")
+                    return
+                if selected_track.get("playbackId") != self.playback.metadata.get("playbackId"):
+                    return
+                protocol = payload.get("protocol") if payload.get("protocol") in {"hls", "progressive"} else ""
+                mime_type = payload.get("mimeType") if payload.get("mimeType") in {"audio/mpeg", "audio/mp4"} else ""
+                started = self.playback.play(
+                    stream_uri,
+                    selected_track,
+                    protocol,
+                    mime_type,
+                )
+                if not started:
+                    self.playback.error = "SoundCloud could not play this track"
+                self._publish_status_once()
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                return
 
         def _save_track_cache(self):
             self.track_cache_save_pending = False
@@ -2124,6 +2848,9 @@ def build_application(show_on_start: bool = False):
             GLib.idle_add(self._publish_status_once)
 
         def _secure_status(self, payload):
+            if self.playback.state != "idle":
+                base = payload if isinstance(payload, dict) else {}
+                payload = {**base, **self.playback.status()}
             state = validate_status_payload(payload)
             if state is None:
                 return {}
@@ -2175,6 +2902,13 @@ def build_application(show_on_start: bool = False):
 
             self._evaluate(status_script(), finished)
             return True
+
+        def _resolution_timed_out(self, generation):
+            if (generation == self.selection_generation
+                    and self.playback.state == "resolving"):
+                self.selection_generation += 1
+                self.playback.stop("SoundCloud took too long to resolve this track")
+            return False
 
         def _respond(self, connection, request_id, payload, publish_status=False):
             try:
@@ -2271,7 +3005,15 @@ def build_application(show_on_start: bool = False):
                         for source, state in lists.items()
                         if source in {"home", "feed"} and isinstance(state, dict)
                     }
-                    self._respond(connection, request_id, {"ok": True, "paths": paths, "lists": safe_lists})
+                    playback_count = _bounded_integer(
+                        payload.get("playbackCount"), 0, MAX_TRACKS * 2
+                    ) if isinstance(payload, dict) else 0
+                    self._respond(connection, request_id, {
+                        "ok": True,
+                        "paths": paths,
+                        "lists": safe_lists,
+                        "playbackCount": playback_count,
+                    })
 
                 self._evaluate(api_observation_script(), observation_finished)
             elif command.startswith("artwork:"):
@@ -2295,15 +3037,25 @@ def build_application(show_on_start: bool = False):
                         ),
                     )
             elif command in {"play-pause", "next", "previous"}:
-                self._evaluate(
-                    command_script(command),
-                    lambda payload: self._respond(
+                if command == "play-pause" and self.playback.active:
+                    self._respond(
                         connection,
                         request_id,
-                        {"ok": bool(payload), "running": True},
+                        {"ok": self.playback.toggle(), "running": True},
                         publish_status=True,
-                    ),
-                )
+                    )
+                else:
+                    if self.playback.active or self.playback.error:
+                        self.playback.stop()
+                    self._evaluate(
+                        command_script(command),
+                        lambda payload: self._respond(
+                            connection,
+                            request_id,
+                            {"ok": bool(payload), "running": True},
+                            publish_status=True,
+                        ),
+                    )
             elif command.startswith("seek:"):
                 try:
                     ratio = float(command.partition(":")[2])
@@ -2314,38 +3066,61 @@ def build_application(show_on_start: bool = False):
                         {"ok": False, "error": "invalid seek position"},
                     )
                 else:
-                    self._evaluate(
-                        seek_script(ratio),
-                        lambda payload: self._respond(
+                    if self.playback.active:
+                        self._respond(
                             connection,
                             request_id,
-                            {"ok": bool(payload), "running": True},
+                            {"ok": self.playback.seek(ratio), "running": True},
                             publish_status=True,
-                        ),
-                    )
-            elif command.startswith("play-url:"):
-                track_url = command.removeprefix("play-url:")
-                script = play_track_script(track_url)
-                if script is None:
+                        )
+                    else:
+                        self._evaluate(
+                            seek_script(ratio),
+                            lambda payload: self._respond(
+                                connection,
+                                request_id,
+                                {"ok": bool(payload), "running": True},
+                                publish_status=True,
+                            ),
+                        )
+            elif (playback_id := playback_id_from_command(command)) is not None:
+                metadata = self.playback_tracks.get(playback_id)
+                if metadata is None:
                     self._respond(
                         connection,
                         request_id,
-                        {"ok": False, "error": "invalid SoundCloud track URL"},
+                        {"ok": False, "error": "SoundCloud track details are not ready"},
                     )
-                else:
-                    self._evaluate(
-                        script,
-                        lambda payload: self._respond(
+                    return False
+                self.selection_generation = (self.selection_generation + 1) % (2**31)
+                generation = self.selection_generation
+                self.playback.begin(metadata)
+                self._publish_status_once()
+                script = play_track_script(playback_id, generation)
+
+                def track_selected(payload):
+                    if generation != self.selection_generation:
+                        self._respond(
                             connection,
                             request_id,
-                            {
-                                "ok": bool(payload),
-                                "running": True,
-                                **({} if payload else {"error": "track is no longer available in this view"}),
-                            },
-                            publish_status=True,
-                        ),
+                            {"ok": False, "error": "selection superseded"},
+                        )
+                        return
+                    if not payload:
+                        self.playback.stop("SoundCloud track details are not ready")
+                    self._respond(
+                        connection,
+                        request_id,
+                        {
+                            "ok": bool(payload),
+                            "running": True,
+                            **({} if payload else {"error": "SoundCloud track details are not ready"}),
+                        },
+                        publish_status=True,
                     )
+
+                self._evaluate(script, track_selected)
+                GLib.timeout_add_seconds(15, self._resolution_timed_out, generation)
             elif source_uri(command):
                 self.pending_autoplay = False
                 self._publish_cached_tracks(command)
@@ -2465,8 +3240,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     daemon.add_argument("--show", action="store_true")
     seek = subparsers.add_parser("seek")
     seek.add_argument("ratio", type=float)
-    play_url = subparsers.add_parser("play-url")
-    play_url.add_argument("url")
+    play = subparsers.add_parser("play")
+    play.add_argument("playback_id")
     subparsers.add_parser("launch")
     subparsers.add_parser("ensure")
     for action in ("status", "tracks", "play-pause", "next", "previous", "home", "likes", "feed", "show", "stop"):
@@ -2488,8 +3263,8 @@ def main(argv: list[str] | None = None) -> int:
     if command != "daemon":
         if command == "seek":
             backend_command = f"seek:{args.ratio}"
-        elif command == "play-url":
-            backend_command = f"play-url:{args.url}"
+        elif command == "play":
+            backend_command = f"play:{args.playback_id}"
         else:
             backend_command = command
         response = request_backend(backend_command)
