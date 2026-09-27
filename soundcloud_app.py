@@ -44,7 +44,6 @@ MAX_RESPONSE_BYTES = 524288
 MAX_TITLE_BYTES = 512
 MAX_ARTIST_BYTES = 256
 MAX_URL_BYTES = 2048
-MAX_ERROR_BYTES = 512
 MAX_TRACKS = 100
 MAX_PLAY_COUNT = 10**12
 MAX_TRACK_DURATION_MS = 7 * 24 * 60 * 60 * 1000
@@ -1762,17 +1761,6 @@ def seek_script(ratio: float) -> str:
     }})()"""
 
 
-def autoplay_script() -> str:
-    return r"""(() => {
-      const button = document.querySelector(
-        '.soundActions__play, .playButton, button[title="Play"], button[aria-label="Play"]'
-      );
-      if (!button) return false;
-      button.click();
-      return true;
-    })()"""
-
-
 def dependency_check() -> dict[str, object]:
     result: dict[str, object] = {
         "python_gobject": False,
@@ -2470,7 +2458,6 @@ def build_application(show_on_start: bool = False):
             super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.NON_UNIQUE)
             self.window = None
             self.webview = None
-            self.pending_autoplay = False
             self.status_subscribers = StatusSubscribers()
             self.status_evaluation_pending = False
             self.artwork_cache = ArtworkCache()
@@ -2580,7 +2567,6 @@ def build_application(show_on_start: bool = False):
                 ("media-playback-requires-user-gesture", False),
             ):
                 settings.set_property(name, value)
-            self.webview.connect("load-changed", self._load_changed)
             self.webview.connect("create", self._create_popup)
             self.webview.connect("decide-policy", self._decide_policy)
             self.window.add(self.webview)
@@ -2809,15 +2795,6 @@ def build_application(show_on_start: bool = False):
             else:
                 decision.ignore()
             return True
-
-        def _load_changed(self, _webview, event):
-            if self.pending_autoplay and event == WebKit2.LoadEvent.FINISHED:
-                self.pending_autoplay = False
-                GLib.timeout_add(900, self._autoplay)
-
-        def _autoplay(self):
-            self._evaluate(autoplay_script(), lambda _payload: None)
-            return False
 
         def _dispatch_from_thread(self, command, connection, request_id):
             if not self.dispatch_slots.acquire(blocking=False):
@@ -3122,7 +3099,6 @@ def build_application(show_on_start: bool = False):
                 self._evaluate(script, track_selected)
                 GLib.timeout_add_seconds(15, self._resolution_timed_out, generation)
             elif source_uri(command):
-                self.pending_autoplay = False
                 self._publish_cached_tracks(command)
                 self.webview.load_uri(source_uri(command))
                 self._respond(connection, request_id, {"ok": True, "running": True})

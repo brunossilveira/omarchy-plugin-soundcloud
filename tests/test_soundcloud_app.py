@@ -1431,7 +1431,6 @@ class BarWidgetTest(unittest.TestCase):
 
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
         self.assertIn("readonly property color dim: Qt.darker(bar.foreground, 1.5)", qml)
-        self.assertIn("readonly property color barDim: Qt.darker(bar.barForeground, 1.5)", qml)
         self.assertIn("function onForegroundChanged() { waveform.requestPaint() }", qml)
         self.assertEqual(set(re.findall(r"#[0-9A-Fa-f]{6}", qml)), {"#ff5500"})
 

@@ -66,7 +66,6 @@ BarWidget {
   readonly property string safeTooltipLabel: plainForHost(label)
   readonly property string playIcon: playing ? "󰏤" : "󰐊"
   readonly property color dim: Qt.darker(bar.foreground, 1.5)
-  readonly property color barDim: Qt.darker(bar.barForeground, 1.5)
 
   function close() { popupOpen = false }
 
@@ -377,14 +376,12 @@ BarWidget {
         else if (requestedSource === "feed") feedLoadMoreAtCount = 0
       }
       if (message.hasMore === false) {
-        var exhaustedSource = requestedSource
-        if (exhaustedSource === "home") homeHasMore = false
-        else if (exhaustedSource === "feed") feedHasMore = false
+        if (requestedSource === "home") homeHasMore = false
+        else if (requestedSource === "feed") feedHasMore = false
       }
       if (message.ok !== true) {
-        var loadMoreSource = kind.substring(10)
-        if (loadMoreSource === "home") homeLoadMoreAtCount = 0
-        else if (loadMoreSource === "feed") feedLoadMoreAtCount = 0
+        if (requestedSource === "home") homeLoadMoreAtCount = 0
+        else if (requestedSource === "feed") feedLoadMoreAtCount = 0
       }
     } else if (kind && kind.indexOf("artwork:") === 0) {
       var artworkId = kind.substring(8)

@@ -214,7 +214,7 @@ effect after the daemon is stopped and relaunched from the bar.
 ## Known fragility
 
 - SoundCloud's private api-v2 schemas and web DOM selectors (in `status_script`,
-  `command_script`, `seek_script`, `autoplay_script`) can change without notice.
+  `command_script`, `seek_script`) can change without notice.
   When playback or lists break, check these first. The `inspect-api` socket command
   reports the api-v2 paths the page has requested.
 - On Hyprland, `WEBKIT_DISABLE_DMABUF_RENDERER=1` is set automatically
