@@ -2063,7 +2063,10 @@ class GstPlayback:
         self.active = False
         self.playing = False
         self.has_started = False
-        self.metadata = {}
+        # Keep the failed track's id so the popup can show the error on its row.
+        self.metadata = (
+            {"playbackId": self.metadata.get("playbackId", "")} if error else {}
+        )
         self.error = error[:128]
         self.state = "error" if self.error else "idle"
         self.on_change()

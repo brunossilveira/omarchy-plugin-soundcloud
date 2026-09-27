@@ -84,6 +84,14 @@ assert.equal(model.isCurrentTrack("soundcloud:tracks:8", "soundcloud:tracks:9"),
 assert.equal(model.isCurrentTrack("", ""), false);
 assert.equal(model.isCurrentTrack(undefined, ""), false);
 
+// A selection error moves onto its row only when that row is in the visible list;
+// otherwise it must stay in the shared error line so it is never hidden.
+const listed = [{ playbackId: "soundcloud:tracks:1" }, { playbackId: "soundcloud:tracks:2" }];
+assert.equal(model.errorShownOnRow(listed, "soundcloud:tracks:2", "error"), true);
+assert.equal(model.errorShownOnRow(listed, "soundcloud:tracks:3", "error"), false);
+assert.equal(model.errorShownOnRow(listed, "soundcloud:tracks:2", "playing"), false);
+assert.equal(model.errorShownOnRow(listed, "", "error"), false);
+
 // The bar follows the theme palette: playback uses the theme accent, while
 // every non-playing state matches the other bar icons.
 assert.equal(model.barIconColor(true, "accent", "foreground"), "accent");

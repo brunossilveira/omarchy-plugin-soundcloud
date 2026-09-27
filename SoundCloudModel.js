@@ -71,6 +71,14 @@ function isCurrentTrack(trackPlaybackId, currentPlaybackId) {
   return current !== "" && String(trackPlaybackId || "") === current
 }
 
+function errorShownOnRow(tracks, playbackId, playbackState) {
+  if (playbackState !== "error" || !Array.isArray(tracks)) return false
+  for (var index = 0; index < tracks.length; index++) {
+    if (tracks[index] && isCurrentTrack(tracks[index].playbackId, playbackId)) return true
+  }
+  return false
+}
+
 function barIconColor(playing, accent, foreground) {
   return playing === true ? accent : foreground
 }
@@ -87,6 +95,7 @@ if (typeof module !== "undefined") {
     canStartAction: canStartAction,
     isCurrentSelectionResponse: isCurrentSelectionResponse,
     isCurrentTrack: isCurrentTrack,
+    errorShownOnRow: errorShownOnRow,
     barIconColor: barIconColor
   }
 }

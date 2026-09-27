@@ -777,6 +777,7 @@ BarWidget {
             property string trackArtDataUrl: String(root.trackArtworkData[artworkId] || "")
             property bool isCurrent: SoundCloudModel.isCurrentTrack(track.playbackId, root.playbackId)
             property string pendingLabel: isCurrent ? SoundCloudModel.pendingLabel(root.playbackState) : ""
+            property bool failed: isCurrent && root.playbackState === "error"
 
             Component.onCompleted: root.requestTrackArtwork(artworkId)
             onArtworkIdChanged: root.requestTrackArtwork(artworkId)
@@ -853,9 +854,9 @@ BarWidget {
 
               Text {
                 width: parent.width
-                text: pendingLabel || root.trackDetails(track)
+                text: pendingLabel || (failed ? root.lastError || "Could not play this track" : root.trackDetails(track))
                 textFormat: Text.PlainText
-                color: pendingLabel ? Color.accent : root.dim
+                color: failed ? root.bar.urgent : (pendingLabel ? Color.accent : root.dim)
                 font.family: root.bar.fontFamily
                 font.pixelSize: Style.font.caption
                 elide: Text.ElideRight
@@ -908,14 +909,27 @@ BarWidget {
           font.pixelSize: Style.font.body
         }
 
-        Text {
+        Column {
           anchors.centerIn: parent
           visible: !root.tracksLoading && root.tracks.length === 0
-          textFormat: Text.PlainText
-          text: "No tracks found"
-          color: root.dim
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.body
+          spacing: Style.space(8)
+
+          Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            textFormat: Text.PlainText
+            text: "No tracks found"
+            color: root.dim
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.body
+          }
+
+          Button {
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: "Retry"
+            foreground: root.bar.foreground
+            enabled: !root.actionBusy
+            onClicked: root.selectTab(root.selectedTab)
+          }
         }
       }
 
@@ -944,6 +958,7 @@ BarWidget {
         id: errorText
         width: parent.width
         visible: root.lastError !== ""
+          && !SoundCloudModel.errorShownOnRow(root.tracks, root.playbackId, root.playbackState)
         textFormat: Text.PlainText
         text: root.lastError
         color: root.bar.urgent

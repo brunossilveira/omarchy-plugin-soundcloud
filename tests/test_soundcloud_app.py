@@ -483,6 +483,22 @@ class BackendCommandTest(unittest.TestCase):
             self.assertEqual(validated["playbackState"], state)
         self.assertIsNone(app.validate_status_payload({**base, "playbackState": "unknown"}))
 
+    def test_failed_selection_keeps_its_track_id_so_the_error_shows_on_its_row(self):
+        app = load_module()
+        player = object.__new__(app.GstPlayback)
+        player.generation = 0
+        player.on_change = lambda: None
+        player._stop_current = lambda: None
+        player.begin({"title": "Broken", "playbackId": "soundcloud:tracks:5"})
+
+        player.stop("SoundCloud could not resolve this track")
+        failed = app.validate_status_payload({**player.status(), "loggedIn": True})
+        self.assertEqual(failed["playbackState"], "error")
+        self.assertEqual(failed["playbackId"], "soundcloud:tracks:5")
+
+        player.stop()
+        self.assertEqual(player.status()["playbackId"], "")
+
     def test_status_identifies_the_selected_track_so_the_list_can_mark_it(self):
         app = load_module()
         player = object.__new__(app.GstPlayback)
