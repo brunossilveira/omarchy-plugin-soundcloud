@@ -778,17 +778,20 @@ BarWidget {
               visible: isCurrent
             }
 
-            Rectangle {
+            BorderSurface {
               id: trackArtwork
               width: Style.space(48)
               height: Style.space(48)
               anchors.left: parent.left
               anchors.leftMargin: Style.space(6)
               anchors.verticalCenter: parent.verticalCenter
-              color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08)
+              radius: Style.spacing.labelGap
+              color: Style.normalFillFor(root.bar.foreground, Color.accent)
+              borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
 
               Image {
                 anchors.fill: parent
+                anchors.margins: Style.space(2)
                 fillMode: Image.PreserveAspectCrop
                 asynchronous: true
                 sourceSize.width: 96
