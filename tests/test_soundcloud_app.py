@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import socket
@@ -508,6 +510,14 @@ class BackendCommandTest(unittest.TestCase):
         self.assertEqual(app.track_source_from_command("tracks:feed"), "feed")
         self.assertIsNone(app.track_source_from_command("tracks"))
         self.assertIsNone(app.track_source_from_command("tracks:https://evil.example"))
+
+    def test_cli_does_not_offer_bare_tracks_command(self):
+        # The backend only answers tracks:home and tracks:feed, so a bare
+        # `tracks` CLI command always failed with "unknown command".
+        app = load_module()
+
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            app.parse_args(["tracks"])
 
     def test_load_more_command_allows_only_route_bound_sources(self):
         app = load_module()

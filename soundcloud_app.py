@@ -3220,7 +3220,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     play.add_argument("playback_id")
     subparsers.add_parser("launch")
     subparsers.add_parser("ensure")
-    for action in ("status", "tracks", "play-pause", "next", "previous", "home", "likes", "feed", "show", "stop"):
+    for action in ("status", "play-pause", "next", "previous", "home", "likes", "feed", "show", "stop"):
         subparsers.add_parser(action)
     return parser.parse_args(argv)
 
