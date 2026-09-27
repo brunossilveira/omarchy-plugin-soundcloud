@@ -4,6 +4,7 @@
   "name": "SoundCloud",
   "version": "0.1.0",
   "author": "Bruno Silveira",
+  "license": "MIT",
   "description": "SoundCloud playback and account controls in the Omarchy bar",
   "kinds": [
     "bar-widget"
@@ -15,6 +16,7 @@
     "displayName": "SoundCloud",
     "description": "Now playing, Home, Feed, and playback controls",
     "category": "Media",
-    "allowMultiple": false
+    "allowMultiple": false,
+    "defaultSection": "right"
   }
 }

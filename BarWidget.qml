@@ -67,7 +67,21 @@ BarWidget {
   readonly property string playIcon: playing ? "󰏤" : "󰐊"
   readonly property color dim: Qt.darker(bar.foreground, 1.5)
 
+  // Bar.qml routes `omarchy-shell shell summon|hide|toggle` through these.
+  readonly property bool opened: popupOpen
+
+  function open() {
+    popupOpen = true
+    if (!backendConnected) startBackend(false)
+    else if (tracks.length === 0) selectTab(selectedTab)
+  }
+
   function close() { popupOpen = false }
+
+  function toggle() {
+    if (popupOpen) close()
+    else open()
+  }
 
   function plainForHost(value) {
     return String(value || "")
@@ -463,11 +477,7 @@ BarWidget {
     onClicked: function(mouse) {
       if (mouse.button === Qt.MiddleButton) root.runAction(root.running ? "play-pause" : "launch")
       else if (mouse.button === Qt.RightButton && root.running) root.runAction("next")
-      else {
-        root.popupOpen = !root.popupOpen
-        if (root.popupOpen && !root.backendConnected) root.startBackend(false)
-        else if (root.popupOpen && root.tracks.length === 0) root.selectTab(root.selectedTab)
-      }
+      else root.toggle()
     }
     onWheel: function(wheel) {
       if (!root.running) return
