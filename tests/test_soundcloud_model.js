@@ -120,3 +120,12 @@ observeListEvent("movement-ended", 31, false);
 assert.equal(requestEvents.length, 2);
 
 console.log("SoundCloudModel tests passed");
+
+// The launcher prints one JSON line. A failed start carries the reason, such
+// as missing packages, so the popup can show it instead of "Not connected".
+assert.equal(
+  model.launchError('{"ok": false, "error": "Missing gst-libav. Run: omarchy pkg add gst-libav"}'),
+  "Missing gst-libav. Run: omarchy pkg add gst-libav",
+);
+assert.equal(model.launchError('{"ok": true, "starting": true, "running": true}'), "");
+assert.equal(model.launchError("not json"), "");

@@ -25,13 +25,15 @@ without official SoundCloud API credentials.
 - `gst-plugins-good` (provides WebKitGTK's required `autoaudiosink`)
 - `gst-libav` (provides AAC decoding for current SoundCloud HLS streams)
 
-Install the GStreamer plugins if needed:
+A stock Omarchy install includes everything except the two GStreamer plugins.
+Install them if needed:
 
 ```sh
 omarchy pkg add gst-plugins-good gst-libav
 ```
 
-Verify all runtime dependencies:
+If a dependency is missing, the popup names the packages to install instead of
+connecting. To verify all runtime dependencies from a terminal:
 
 ```sh
 python3 soundcloud_app.py check
@@ -72,6 +74,8 @@ keeps running.
 
 ## Troubleshooting
 
+- The popup reports missing packages: install them with the `omarchy pkg add`
+  command it shows, then select Connect again.
 - Nothing plays: run `python3 soundcloud_app.py check` and install any missing
   GStreamer plugins.
 - Lists or playback stop working: SoundCloud may have changed its private web API.

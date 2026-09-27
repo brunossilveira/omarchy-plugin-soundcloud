@@ -1562,6 +1562,63 @@ class CheckResultTest(unittest.TestCase):
         self.assertEqual(result["gstreamer_playback_elements"], True)
         self.assertIn("ok", result)
 
+    def test_missing_gstreamer_elements_name_every_package_to_install(self):
+        app = load_module()
+        stock_omarchy = {"playbin3", "appsrc", "audioconvert", "audioresample"}
+
+        packages = app.missing_gstreamer_packages(lambda name: name in stock_omarchy)
+
+        self.assertEqual(packages, ["gst-plugins-good", "gst-libav"])
+
+    def test_missing_aac_decoder_alone_names_only_gst_libav(self):
+        app = load_module()
+
+        packages = app.missing_gstreamer_packages(lambda name: name != "avdec_aac")
+
+        self.assertEqual(packages, ["gst-libav"])
+
+    def test_install_hint_is_a_command_the_user_can_run(self):
+        app = load_module()
+
+        hint = app.install_hint(["gst-plugins-good", "gst-libav"])
+
+        self.assertIn("omarchy pkg add gst-plugins-good gst-libav", hint)
+
+
+class LaunchBackendTest(unittest.TestCase):
+    missing = {"ok": False, "error": "Missing gst-libav. Run: omarchy pkg add gst-libav"}
+
+    def test_missing_dependencies_are_reported_instead_of_starting_a_doomed_backend(self):
+        app = load_module()
+        with mock.patch.object(app, "request_backend", return_value=None), \
+                mock.patch.object(app, "dependency_check", return_value=self.missing), \
+                mock.patch.object(app.subprocess, "Popen") as popen:
+            result = app.launch_backend(show=False)
+
+        popen.assert_not_called()
+        self.assertEqual(result["ok"], False)
+        self.assertEqual(result["error"], self.missing["error"])
+
+    def test_running_backend_is_reused_without_checking_dependencies(self):
+        app = load_module()
+        with mock.patch.object(app, "request_backend", return_value={"ok": True, "running": True}), \
+                mock.patch.object(app, "dependency_check") as check:
+            result = app.launch_backend(show=False)
+
+        check.assert_not_called()
+        self.assertEqual(result["running"], True)
+
+    def test_ensure_exits_nonzero_with_the_error_on_stdout(self):
+        app = load_module()
+        stdout = io.StringIO()
+        with mock.patch.object(app, "request_backend", return_value=None), \
+                mock.patch.object(app, "dependency_check", return_value=self.missing), \
+                contextlib.redirect_stdout(stdout):
+            code = app.main(["ensure"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(stdout.getvalue())["error"], self.missing["error"])
+
 
 class BarWidgetTest(unittest.TestCase):
     def test_runtime_commands_use_one_persistent_socket(self):

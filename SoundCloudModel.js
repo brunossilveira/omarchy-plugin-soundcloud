@@ -83,6 +83,15 @@ function barIconColor(playing, accent, foreground) {
   return playing === true ? accent : foreground
 }
 
+function launchError(line) {
+  try {
+    var result = JSON.parse(line)
+    return result && result.ok === false && result.error ? String(result.error) : ""
+  } catch (error) {
+    return ""
+  }
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     displayLabel: displayLabel,
@@ -96,6 +105,7 @@ if (typeof module !== "undefined") {
     isCurrentSelectionResponse: isCurrentSelectionResponse,
     isCurrentTrack: isCurrentTrack,
     errorShownOnRow: errorShownOnRow,
-    barIconColor: barIconColor
+    barIconColor: barIconColor,
+    launchError: launchError
   }
 }

@@ -1032,11 +1032,18 @@ BarWidget {
     id: launcherProcess
     running: false
     command: []
+    stdout: SplitParser {
+      onRead: function(line) {
+        var error = SoundCloudModel.launchError(line)
+        if (error) root.lastError = error
+      }
+    }
+    onStarted: root.lastError = ""
     onExited: function(exitCode) {
       if (exitCode !== 0) {
         root.actionBusy = false
         root.launchingBackend = false
-        root.lastError = "Could not start SoundCloud"
+        if (!root.lastError) root.lastError = "Could not start SoundCloud"
       } else {
         root.socketProbePending = true
       }

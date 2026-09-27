@@ -1821,6 +1821,26 @@ def seek_script(ratio: float) -> str:
     }})()"""
 
 
+GSTREAMER_PACKAGE_ELEMENTS = (
+    ("gst-plugins-good", (
+        "playbin3", "appsrc", "mpegaudioparse", "mpg123audiodec",
+        "audioconvert", "audioresample", "autoaudiosink", "hlsdemux2", "souphttpsrc",
+    )),
+    ("gst-libav", ("avdec_aac",)),
+)
+
+
+def missing_gstreamer_packages(find) -> list[str]:
+    return [
+        package for package, elements in GSTREAMER_PACKAGE_ELEMENTS
+        if not all(find(name) for name in elements)
+    ]
+
+
+def install_hint(packages: list[str]) -> str:
+    return f"Missing {', '.join(packages)}. Run: omarchy pkg add {' '.join(packages)}"
+
+
 def dependency_check() -> dict[str, object]:
     result: dict[str, object] = {
         "python_gobject": False,
@@ -1833,37 +1853,35 @@ def dependency_check() -> dict[str, object]:
     }
     try:
         import gi
-
-        result["python_gobject"] = True
-        gi.require_version("Gtk", "3.0")
-        gi.require_version("WebKit2", "4.1")
-        gi.require_version("Gst", "1.0")
+    except ImportError:
+        result["error"] = install_hint(["python-gobject"])
+        return result
+    result["python_gobject"] = True
+    missing_libraries = []
+    for namespace, version, package in (
+        ("Gtk", "3.0", "gtk3"), ("WebKit2", "4.1", "webkit2gtk-4.1"), ("Gst", "1.0", "gstreamer"),
+    ):
+        try:
+            gi.require_version(namespace, version)
+        except ValueError:
+            missing_libraries.append(package)
+    if missing_libraries:
+        result["error"] = install_hint(missing_libraries)
+        return result
+    try:
         from gi.repository import Gst, Gtk, WebKit2  # noqa: F401
 
         Gst.init(None)
-        result["gstreamer_autoaudiosink"] = bool(
-            Gst.ElementFactory.find("autoaudiosink")
+        find = lambda name: bool(Gst.ElementFactory.find(name))
+        result["gstreamer_autoaudiosink"] = find("autoaudiosink")
+        result["gstreamer_aac_decoder"] = find("avdec_aac")
+        result["gstreamer_playback_elements"] = all(
+            find(name) for name in GSTREAMER_PACKAGE_ELEMENTS[0][1]
         )
-        result["gstreamer_aac_decoder"] = bool(Gst.ElementFactory.find("avdec_aac"))
-        required_elements = (
-            "playbin3", "appsrc", "mpegaudioparse", "mpg123audiodec",
-            "audioconvert", "audioresample", "autoaudiosink", "hlsdemux2", "souphttpsrc",
-        )
-        missing_elements = [
-            name for name in required_elements if not Gst.ElementFactory.find(name)
-        ]
-        result["gstreamer_playback_elements"] = not missing_elements
-        if not result["gstreamer_autoaudiosink"]:
-            result["error"] = "GStreamer autoaudiosink is missing; install gst-plugins-good"
-        elif not result["gstreamer_aac_decoder"]:
-            result["error"] = "GStreamer AAC decoder is missing; install gst-libav"
-        elif missing_elements:
-            result["error"] = "Missing GStreamer elements: " + ", ".join(missing_elements)
-        result["ok"] = bool(
-            result["gstreamer_autoaudiosink"]
-            and result["gstreamer_aac_decoder"]
-            and result["gstreamer_playback_elements"]
-        )
+        missing_packages = missing_gstreamer_packages(find)
+        if missing_packages:
+            result["error"] = install_hint(missing_packages)
+        result["ok"] = not missing_packages
     except (ImportError, ValueError) as exc:
         result["error"] = str(exc)
     return result
@@ -3231,6 +3249,9 @@ def launch_backend(show: bool) -> dict[str, object]:
     existing = request_backend("show" if show else "status", timeout=0.8)
     if existing is not None:
         return existing
+    check = dependency_check()
+    if not check["ok"]:
+        return {"ok": False, "running": False, "error": check.get("error", "")}
     command = ["/usr/bin/python3", "-I", str(Path(__file__).resolve()), "daemon"]
     if show:
         command.append("--show")
@@ -3301,8 +3322,9 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, sort_keys=True))
         return 0 if result["ok"] else 1
     if command in {"launch", "ensure"}:
-        print(json.dumps(launch_backend(show=command == "launch"), sort_keys=True))
-        return 0
+        result = launch_backend(show=command == "launch")
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result.get("running") else 1
     if command != "daemon":
         if command == "seek":
             backend_command = f"seek:{args.ratio}"
