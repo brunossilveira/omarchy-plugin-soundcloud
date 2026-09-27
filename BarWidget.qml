@@ -885,6 +885,18 @@ BarWidget {
         }
       }
 
+      Text {
+        width: parent.width
+        visible: !root.running || !root.loggedIn
+        textFormat: Text.PlainText
+        text: "A SoundCloud window opens. Sign in there once, then close it. Playback keeps running and you stay signed in."
+        color: root.dim
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.caption
+        horizontalAlignment: Text.AlignHCenter
+        wrapMode: Text.WordWrap
+      }
+
       Button {
         anchors.horizontalCenter: parent.horizontalCenter
         visible: !root.running || !root.loggedIn
