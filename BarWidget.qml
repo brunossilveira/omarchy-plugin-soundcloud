@@ -730,6 +730,13 @@ BarWidget {
             onArtworkIdChanged: root.requestTrackArtwork(artworkId)
 
             Rectangle {
+              anchors.fill: parent
+              radius: Style.spacing.labelGap
+              color: Qt.alpha("#ff5500", 0.28)
+              visible: trackMouse.enabled && trackMouse.containsMouse
+            }
+
+            Rectangle {
               id: trackArtwork
               width: Style.space(48)
               height: Style.space(48)
@@ -787,7 +794,9 @@ BarWidget {
             }
 
             MouseArea {
+              id: trackMouse
               anchors.fill: parent
+              hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
               enabled: (!root.actionBusy || root.selectionBusy)
                 && /^soundcloud:tracks:[1-9][0-9]*$/.test(String(track.playbackId || ""))
