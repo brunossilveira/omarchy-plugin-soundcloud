@@ -24,6 +24,23 @@ reads the SoundCloud web app's own API responses to build the Home and Feed list
 and to resolve stream URLs, then plays the audio locally with GStreamer. The bar
 widget talks to the backend over a private Unix socket.
 
+- The backend (`soundcloud_app.py`) starts only when you interact with the widget.
+  When the shell starts, the widget only looks for a running backend, so playback
+  survives shell restarts.
+- The backend stops when the plugin is removed, or 10 seconds after the bar widget
+  disconnects.
+- Home and Feed are built from the SoundCloud page's own API responses and
+  paginated through SoundCloud's API cursors. Each list keeps at most 100 tracks
+  and is cached so the popup has content right after a restart.
+- Selecting a track resolves it to a short-lived stream URL inside the WebKit view.
+  The backend then plays it with GStreamer, directly for progressive streams and
+  through a bounded segment fetcher for HLS. A track that does not resolve within
+  15 seconds shows an error.
+- Play/pause and seek control GStreamer when it is playing. Otherwise they, and
+  previous/next, control SoundCloud's own web player.
+- On Hyprland the backend sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` to avoid
+  WebKitGTK rendering crashes.
+
 ## Requirements
 
 - Omarchy 4 with `omarchy-shell`
@@ -75,10 +92,18 @@ keeps running.
 
 ## Privacy and security
 
+- Network endpoints: the hidden WebKit view loads the `soundcloud.com` web app,
+  which makes its own `api-v2.soundcloud.com` calls and loads whatever
+  subresources (scripts, images, analytics) SoundCloud's page includes. Top-level
+  navigation is limited to `soundcloud.com` hosts. The Python backend itself
+  fetches audio only from `*.sndcdn.com` and `*.soundcloud.cloud` and artwork only
+  from `i1.sndcdn.com`, over HTTPS.
 - WebKit uses an ephemeral in-memory profile and cache; it is never given a
   pathname to reopen for session storage.
 - The session survives restarts through a bounded, owner-only cookie jar in
   `~/.local/share/omarchy-soundcloud/`. The account password is never stored.
+- SoundCloud's request authorization headers stay inside the WebKit view. They
+  are never passed to the backend, logged, or written to disk.
 - Artwork is downloaded only from SoundCloud's `i1.sndcdn.com` CDN through a
   bounded HTTPS fetcher, validated as PNG or JPEG, and passed to the shell as
   bounded image data.
@@ -121,8 +146,15 @@ omarchy plugin remove brunosilveira.soundcloud
 ```
 
 The backend watches the installed plugin path, shuts down when it disappears,
-and removes its runtime socket. The owner-only SoundCloud cookie store is
-intentionally kept so reinstalling does not require another sign-in.
+and removes its runtime socket. These owner-only files in
+`~/.local/share/omarchy-soundcloud/` are intentionally kept so reinstalling does
+not require another sign-in:
+
+- `cookies.json`: the SoundCloud session cookies
+- `tracks.json`: the cached Home and Feed track lists (titles, artists, links)
+
+The runtime directory `$XDG_RUNTIME_DIR/omarchy-soundcloud/` (lock file and the
+optional `pagination.log`) is also kept until logout.
 
 To remove persistent state too, run these commands in this order while the plugin
 is still installed:
@@ -140,6 +172,9 @@ python3 -m unittest tests/test_soundcloud_app.py -v
 node tests/test_soundcloud_model.js
 omarchy plugin validate .
 ```
+
+The Python tests need `node`, which runs the injected page scripts. They do not
+need GTK or a display.
 
 - QML changes take effect after `omarchy-restart-shell`.
 - Python changes take effect after `python3 soundcloud_app.py stop` and relaunching
