@@ -1604,13 +1604,13 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn("track.durationMs", qml)
         self.assertIn('"—:—"', qml)
 
-    def test_theme_colors_follow_bar_palette_except_soundcloud_brand_accent(self):
+    def test_theme_colors_follow_bar_palette(self):
         import re
 
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
         self.assertIn("readonly property color dim: Qt.darker(bar.foreground, 1.5)", qml)
         self.assertIn("function onForegroundChanged() { waveform.requestPaint() }", qml)
-        self.assertEqual(set(re.findall(r"#[0-9A-Fa-f]{6}", qml)), {"#ff5500"})
+        self.assertEqual(re.findall(r"#[0-9A-Fa-f]{6}", qml), [])
 
     def test_every_qml_text_sink_is_plain_text(self):
         import re

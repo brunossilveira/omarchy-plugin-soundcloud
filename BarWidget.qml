@@ -617,9 +617,11 @@ BarWidget {
             : 0
 
           property var levels: root.waveformLevels
+          property color playedColor: Color.accent
 
           onPlayedRatioChanged: requestPaint()
           onLevelsChanged: requestPaint()
+          onPlayedColorChanged: requestPaint()
           onWidthChanged: requestPaint()
           onHeightChanged: requestPaint()
 
@@ -638,7 +640,7 @@ BarWidget {
               var lineY = (height - lineHeight) / 2
               context.fillStyle = dimColor
               context.fillRect(0, lineY, width, lineHeight)
-              context.fillStyle = "#ff5500"
+              context.fillStyle = playedColor
               context.fillRect(0, lineY, width * playedRatio, lineHeight)
               return
             }
@@ -650,7 +652,7 @@ BarWidget {
               var x = index * (barWidth + gap)
               var y = (height - barHeight) / 2
               context.fillStyle = index / count <= playedRatio
-                ? "#ff5500"
+                ? playedColor
                 : dimColor
               context.fillRect(x, y, barWidth, barHeight)
             }
