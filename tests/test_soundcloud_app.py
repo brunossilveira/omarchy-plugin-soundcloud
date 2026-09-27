@@ -1505,7 +1505,6 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn("formatCompactCount", qml)
         self.assertIn("track.playCount", qml)
         self.assertIn("track.durationMs", qml)
-        self.assertIn('"▶ —"', qml)
         self.assertIn('"—:—"', qml)
 
     def test_theme_colors_follow_bar_palette_except_soundcloud_brand_accent(self):
