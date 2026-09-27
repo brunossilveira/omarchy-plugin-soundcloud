@@ -1242,6 +1242,103 @@ eval({json.dumps(capture_script)});
         self.assertTrue(result["playback"][0]["ok"])
         self.assertNotIn("private-test-value", completed.stdout)
 
+    def test_playback_carries_the_real_waveform_from_soundcloud_only(self):
+        app = load_module()
+        capture_script = app.api_request_capture_script()
+
+        def run(waveform_url, samples="[...Array(76).fill(140), ...Array(76).fill(35)]"):
+            harness = f"""
+const playback = [];
+const calls = [];
+global.location = {{ href: 'https://soundcloud.com/feed', hostname: 'soundcloud.com', pathname: '/feed' }};
+global.document = {{ querySelector() {{ return null; }} }};
+global.window = global;
+window.webkit = {{ messageHandlers: {{
+  omarchyTracks: {{ postMessage() {{}} }},
+  omarchyPlayback: {{ postMessage(value) {{ playback.push(JSON.parse(value)); }} }}
+}} }};
+window.fetch = async function(input) {{
+  const url = typeof input === 'string' ? input : input.url;
+  calls.push(url);
+  let payload;
+  if (url.includes('/tracks?')) payload = [{{
+    kind: 'track', id: 777, urn: 'soundcloud:tracks:777',
+    permalink_url: 'https://soundcloud.com/a/direct', title: 'Direct', duration: 3000,
+    waveform_url: {json.dumps(waveform_url)},
+    user: {{ username: 'A' }}, media: {{ transcodings: [{{
+      url: 'https://api-v2.soundcloud.com/media/direct',
+      format: {{ protocol: 'progressive', mime_type: 'audio/mpeg' }}
+    }}] }}
+  }}];
+  else if (url.includes('/media/direct')) payload = {{ url: 'https://cf-media.sndcdn.com/direct.mp3' }};
+  else if (url.includes('_m.json')) payload = {{
+    width: 152, height: 140, samples: {samples}
+  }};
+  else payload = {{ collection: [], next_href: null }};
+  return new Response(JSON.stringify(payload), {{ status: 200 }});
+}};
+global.XMLHttpRequest = function() {{}};
+XMLHttpRequest.prototype.open = function() {{}};
+XMLHttpRequest.prototype.setRequestHeader = function() {{}};
+XMLHttpRequest.prototype.send = function() {{}};
+XMLHttpRequest.prototype.addEventListener = function() {{}};
+eval({json.dumps(capture_script)});
+(async () => {{
+  await window.fetch(new Request('https://api-v2.soundcloud.com/stream?client_id=public-test'));
+  await new Promise(setImmediate);
+  window.__omarchyPlayApiTrack('soundcloud:tracks:777', 42);
+  for (let index = 0; index < 12; index++) await new Promise(setImmediate);
+  process.stdout.write(JSON.stringify({{ calls, playback: playback.map(({{ streamUrl, ...x }}) => x) }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+            completed = subprocess.run(
+                ["node", "-e", harness], check=True, capture_output=True, text=True
+            )
+            return json.loads(completed.stdout)
+
+        # SoundCloud's track JSON points at a PNG; the same path serves JSON samples.
+        real = run("https://wave.sndcdn.com/AbC123_m.png")
+        waveform = real["playback"][0]["waveform"]
+        self.assertEqual(len(waveform), 76)
+        self.assertEqual(waveform[0], 100)
+        self.assertEqual(waveform[-1], 20)
+        self.assertIn("https://wave.sndcdn.com/AbC123_m.json", real["calls"])
+
+        # A dense mix (levels 72-100%) must still span the full height.
+        dense = run(
+            "https://wave.sndcdn.com/AbC123_m.json",
+            "Array.from({ length: 76 }, (_, index) => 101 + (index % 2) * 39)",
+        )["playback"][0]["waveform"]
+        self.assertEqual((min(dense), max(dense)), (20, 100))
+
+        # A near-constant signal is not amplified into noise.
+        steady = run(
+            "https://wave.sndcdn.com/AbC123_m.json",
+            "Array.from({ length: 76 }, (_, index) => 138 + (index % 2) * 2)",
+        )["playback"][0]["waveform"]
+        self.assertGreater(min(steady), 95)
+
+        foreign = run("https://attacker.example/AbC123_m.json")
+        self.assertTrue(foreign["playback"][0]["ok"])
+        self.assertEqual(foreign["playback"][0]["waveform"], [])
+        self.assertFalse(any("attacker" in call for call in foreign["calls"]))
+
+    def test_waveform_reaches_status_only_as_bounded_levels(self):
+        app = load_module()
+        self.assertEqual(app.validate_waveform([0, 50, 100]), [0, 50, 100])
+        for invalid in ([101], [-1], [True], [1.5], ["9"], [0] * 201, "0,1", None):
+            self.assertEqual(app.validate_waveform(invalid), [])
+
+        player = object.__new__(app.GstPlayback)
+        player.active = True
+        player.playing = True
+        player.state = "playing"
+        player.error = ""
+        player.metadata = {"title": "T", "waveform": [10, 90]}
+        player._query_time = lambda _method: 1.0
+        validated = app.validate_status_payload({**player.status(), "loggedIn": True})
+        self.assertEqual(validated["waveform"], [10, 90])
+
     def test_late_resolution_cannot_replace_a_newer_track_selection(self):
         app = load_module()
         capture_script = app.api_request_capture_script()

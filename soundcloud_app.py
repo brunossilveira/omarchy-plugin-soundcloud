@@ -64,6 +64,7 @@ SEND_TIMEOUT_SECONDS = 0.1
 HLS_MAX_WORKERS = 2
 HLS_OPERATION_SECONDS = 45.0
 ARTWORK_HOSTS = {"i1.sndcdn.com"}
+MAX_WAVEFORM_BARS = 200
 SOUNDCLOUD_WEB_HOSTS = {
     "soundcloud.com",
     "www.soundcloud.com",
@@ -780,6 +781,7 @@ def api_request_capture_script() -> str:
                     protocol: playable ? playable.format.protocol : '',
                     mimeType: playable ? playable.format.mime_type : '',
                     streams: !playable,
+                    waveformUrl: String(value.waveform_url || '').slice(0, 2048),
                     track
                   });
                 }
@@ -980,6 +982,37 @@ def api_request_capture_script() -> str:
         };
       };
       const originalFetch = window.fetch.bind(window);
+      const loadWaveform = async (value) => {
+        const source = new URL(String(value || '').replace(/\.png$/, '.json'));
+        if (source.protocol !== 'https:' || source.hostname !== 'wave.sndcdn.com'
+            || source.port || source.username || source.password
+            || !/^\/[A-Za-z0-9_-]+\.json$/.test(source.pathname)) return [];
+        const response = await originalFetch(source.href, {
+          method: 'GET', credentials: 'omit', redirect: 'error', referrerPolicy: 'no-referrer'
+        });
+        if (!response.ok) return [];
+        const payload = JSON.parse(await boundedText(response, 262144));
+        const samples = payload && Array.isArray(payload.samples) ? payload.samples : [];
+        const height = Number(payload.height);
+        if (!samples.length || !(height > 0)) return [];
+        const count = 76;
+        const bars = [];
+        for (let index = 0; index < count; index++) {
+          const start = Math.floor(index * samples.length / count);
+          const end = Math.max(start + 1, Math.floor((index + 1) * samples.length / count));
+          let peak = 0;
+          for (let sample = start; sample < end && sample < samples.length; sample++) {
+            const level = Number(samples[sample]);
+            if (Number.isFinite(level) && level > peak) peak = level;
+          }
+          bars.push(Math.min(1, peak / height) * 100);
+        }
+        // Stretch each track's own range so dense mixes still show shape.
+        const lowest = Math.min(...bars);
+        const highest = Math.max(...bars);
+        if (highest - lowest < 5) return bars.map(Math.round);
+        return bars.map((level) => Math.round(20 + (level - lowest) / (highest - lowest) * 80));
+      };
       window.__omarchyPlayApiTrack = function(value, requestId) {
         const target = String(value || '');
         if (!/^soundcloud:tracks:[0-9]+$/.test(target)
@@ -1019,7 +1052,9 @@ def api_request_capture_script() -> str:
           if (!item) throw new Error('track unavailable');
           return item;
         };
-        loadItem().then((item) => originalFetch(item.endpoint, {
+        const itemLoaded = loadItem();
+        const waveformLoaded = itemLoaded.then((item) => loadWaveform(item.waveformUrl)).catch(() => []);
+        itemLoaded.then((item) => originalFetch(item.endpoint, {
           method: 'GET', headers: item.headers, credentials: item.credentials,
           cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer'
         }).then((response) => {
@@ -1056,14 +1091,22 @@ def api_request_capture_script() -> str:
           if (stream.protocol !== 'https:' || stream.port || stream.username || stream.password
               || !(host.endsWith('.sndcdn.com') || host.endsWith('.soundcloud.cloud')))
             throw new Error('invalid stream URL');
-          window.webkit.messageHandlers.omarchyPlayback.postMessage(JSON.stringify({
-            ok: true,
-            requestId,
-            streamUrl: stream.href,
-            protocol,
-            mimeType,
-            track: item.track
-          }));
+          // Never hold playback for the waveform: a slow fetch just means no bars.
+          let timer;
+          const waveformDeadline = new Promise((resolve) => { timer = setTimeout(() => resolve([]), 500); });
+          return Promise.race([waveformLoaded, waveformDeadline]).then((waveform) => {
+            clearTimeout(timer);
+            if (generation !== playbackGeneration) return;
+            window.webkit.messageHandlers.omarchyPlayback.postMessage(JSON.stringify({
+              ok: true,
+              requestId,
+              streamUrl: stream.href,
+              protocol,
+              mimeType,
+              track: item.track,
+              waveform
+            }));
+          });
         })).catch((error) => {
           if (generation !== playbackGeneration) return;
           const detail = /^HTTP [0-9]{3}$/.test(String(error && error.message || ''))
@@ -1356,8 +1399,20 @@ def validate_status_payload(payload: object) -> dict[str, object] | None:
         "url": page_url,
         "duration": duration,
         "position": min(position, duration) if duration else position,
+        "waveform": validate_waveform(payload.get("waveform", [])),
         **({"error": error} if error else {}),
     }
+
+
+def validate_waveform(value: object) -> list[int]:
+    if not isinstance(value, list) or len(value) > MAX_WAVEFORM_BARS:
+        return []
+    if not all(
+        isinstance(level, int) and not isinstance(level, bool) and 0 <= level <= 100
+        for level in value
+    ):
+        return []
+    return list(value)
 
 
 def validate_tracks_payload(payload: object) -> dict[str, object] | None:
@@ -2178,6 +2233,7 @@ class GstPlayback:
                 "artUrl": "",
                 "duration": 0.0,
                 "position": 0.0,
+                "waveform": [],
                 **({"error": self.error} if self.error else {}),
             }
         duration = self._query_time("query_duration")
@@ -2193,6 +2249,7 @@ class GstPlayback:
             "artUrl": str(self.metadata.get("artUrl", "")),
             "duration": duration,
             "position": self._query_time("query_position"),
+            "waveform": list(self.metadata.get("waveform", [])),
             **({"error": self.error} if self.error else {}),
         }
 
@@ -2702,7 +2759,7 @@ def build_application(show_on_start: bool = False):
                 mime_type = payload.get("mimeType") if payload.get("mimeType") in {"audio/mpeg", "audio/mp4"} else ""
                 started = self.playback.play(
                     stream_uri,
-                    selected_track,
+                    {**selected_track, "waveform": validate_waveform(payload.get("waveform"))},
                     protocol,
                     mime_type,
                 )

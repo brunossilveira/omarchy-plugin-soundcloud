@@ -18,6 +18,7 @@ BarWidget {
   property string title: ""
   property string artist: ""
   property string artDataUrl: ""
+  property var waveformLevels: []
   property real duration: 0
   property real position: 0
   property string lastError: ""
@@ -334,6 +335,7 @@ BarWidget {
       title = incomingTitle
       playbackId = String(state.playbackId || "")
       artist = String(state.artist || "").slice(0, 256)
+      waveformLevels = Array.isArray(state.waveform) ? state.waveform : []
     }
     if (popupOpen && loggedIn && !wasLoggedIn && tracks.length === 0) {
       sendCommand(selectedTab, "action")
@@ -614,7 +616,10 @@ BarWidget {
             ? Math.max(0, Math.min(1, root.position / root.duration))
             : 0
 
+          property var levels: root.waveformLevels
+
           onPlayedRatioChanged: requestPaint()
+          onLevelsChanged: requestPaint()
           onWidthChanged: requestPaint()
           onHeightChanged: requestPaint()
 
@@ -626,17 +631,27 @@ BarWidget {
           onPaint: {
             var context = getContext("2d")
             context.reset()
-            var count = 76
+            var dimColor = Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.28)
+            if (!levels || levels.length === 0) {
+              // No real waveform for this track: plain progress bar.
+              var lineHeight = 4
+              var lineY = (height - lineHeight) / 2
+              context.fillStyle = dimColor
+              context.fillRect(0, lineY, width, lineHeight)
+              context.fillStyle = "#ff5500"
+              context.fillRect(0, lineY, width * playedRatio, lineHeight)
+              return
+            }
+            var count = levels.length
             var gap = 2
             var barWidth = Math.max(1, (width - (count - 1) * gap) / count)
             for (var index = 0; index < count; index++) {
-              var shape = Math.abs(Math.sin(index * 1.73) * Math.cos(index * 0.37))
-              var barHeight = Math.max(3, height * (0.18 + shape * 0.78))
+              var barHeight = Math.max(3, height * Number(levels[index]) / 100)
               var x = index * (barWidth + gap)
               var y = (height - barHeight) / 2
               context.fillStyle = index / count <= playedRatio
                 ? "#ff5500"
-                : Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.28)
+                : dimColor
               context.fillRect(x, y, barWidth, barHeight)
             }
           }
