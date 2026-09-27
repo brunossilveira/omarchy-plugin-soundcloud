@@ -504,27 +504,6 @@ BarWidget {
       spacing: Style.space(12)
 
       Row {
-        anchors.horizontalCenter: parent.horizontalCenter
-        spacing: Style.space(8)
-
-        Button {
-          text: "Home"
-          foreground: root.bar.foreground
-          enabled: !root.actionBusy
-          opacity: root.selectedTab === "home" ? 1 : 0.55
-          onClicked: root.selectTab("home")
-        }
-
-        Button {
-          text: "Feed"
-          foreground: root.bar.foreground
-          enabled: !root.actionBusy
-          opacity: root.selectedTab === "feed" ? 1 : 0.55
-          onClicked: root.selectTab("feed")
-        }
-      }
-
-      Row {
         width: parent.width
         spacing: Style.space(10)
 
@@ -695,6 +674,27 @@ BarWidget {
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
           }
+        }
+      }
+
+      Row {
+        spacing: Style.space(8)
+        visible: root.running && root.loggedIn
+
+        Button {
+          text: "Home"
+          foreground: root.bar.foreground
+          enabled: !root.actionBusy
+          selected: root.selectedTab === "home"
+          onClicked: root.selectTab("home")
+        }
+
+        Button {
+          text: "Feed"
+          foreground: root.bar.foreground
+          enabled: !root.actionBusy
+          selected: root.selectedTab === "feed"
+          onClicked: root.selectTab("feed")
         }
       }
 
