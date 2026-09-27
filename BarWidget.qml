@@ -579,13 +579,31 @@ BarWidget {
           opacity: enabled ? 1 : 0.4
           onClicked: root.runAction("previous")
         }
-        Button {
-          iconText: root.playIcon
-          foreground: root.bar.foreground
-          iconSize: Style.font.iconLarge
+        Rectangle {
+          anchors.verticalCenter: parent.verticalCenter
+          width: Style.space(40)
+          height: width
+          radius: width / 2
+          color: playPauseMouse.containsMouse ? Qt.lighter(Color.accent, 1.15) : Color.accent
           enabled: !root.actionBusy && root.hasTrack
           opacity: enabled ? 1 : 0.4
-          onClicked: root.runAction("play-pause")
+
+          Text {
+            anchors.centerIn: parent
+            textFormat: Text.PlainText
+            text: root.playIcon
+            color: root.bar.background
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.iconLarge
+          }
+
+          MouseArea {
+            id: playPauseMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.runAction("play-pause")
+          }
         }
         Button {
           iconText: "󰒭"
