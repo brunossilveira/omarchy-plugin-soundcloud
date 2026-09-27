@@ -549,7 +549,7 @@ BarWidget {
           Text {
             width: parent.width
             textFormat: Text.PlainText
-            text: root.title || (root.loggedIn ? "Nothing playing" : "SoundCloud")
+            text: root.title || (root.running && root.loggedIn ? "Nothing playing" : "SoundCloud")
             color: root.bar.foreground
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.subtitle
@@ -998,7 +998,8 @@ BarWidget {
         if (connected) root.initializeConnection()
         else {
           root.resetConnectionState()
-          root.running = false
+          // Drop the last track so a dead backend never looks like it is playing.
+          root.applyStatus({ running: false, playerPresent: false })
         }
       }
     }
