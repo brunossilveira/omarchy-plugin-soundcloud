@@ -761,7 +761,7 @@ BarWidget {
             Rectangle {
               anchors.fill: parent
               radius: Style.spacing.labelGap
-              color: Qt.alpha("#ff5500", 0.28)
+              color: Style.hoverFillFor(root.bar.foreground, Color.accent)
               visible: trackMouse.enabled && trackMouse.containsMouse
             }
 
