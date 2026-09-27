@@ -299,10 +299,13 @@ BarWidget {
   function trackDetails(track) {
     var details = [String(track.artist || "SoundCloud")]
     var playCount = Math.max(0, Math.floor(Number(track.playCount) || 0))
-    var durationMs = Math.max(0, Math.floor(Number(track.durationMs) || 0))
     if (playCount > 0) details.push("▶ " + formatCompactCount(playCount))
-    details.push(durationMs > 0 ? formatTime(durationMs / 1000) : "—:—")
     return details.join("  •  ")
+  }
+
+  function trackDuration(track) {
+    var durationMs = Math.max(0, Math.floor(Number(track.durationMs) || 0))
+    return durationMs > 0 ? formatTime(durationMs / 1000) : "—:—"
   }
 
   function applyStatus(state) {
@@ -832,7 +835,8 @@ BarWidget {
             Column {
               anchors.left: trackArtwork.right
               anchors.leftMargin: Style.space(9)
-              anchors.right: parent.right
+              anchors.right: trackDurationText.left
+              anchors.rightMargin: Style.space(9)
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(2)
 
@@ -856,6 +860,18 @@ BarWidget {
                 font.pixelSize: Style.font.caption
                 elide: Text.ElideRight
               }
+            }
+
+            Text {
+              id: trackDurationText
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(6)
+              anchors.verticalCenter: parent.verticalCenter
+              text: root.trackDuration(track)
+              textFormat: Text.PlainText
+              color: root.dim
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
             }
 
             MouseArea {
