@@ -53,9 +53,10 @@ omarchy-shell shell toggle brunosilveira.soundcloud
 ## First sign-in
 
 1. Click the SoundCloud icon in the top bar.
-2. Select `Sign in to SoundCloud`.
-3. Sign in inside the SoundCloud window.
-4. Close the window after the account page loads.
+2. Select `Connect`.
+3. Select `Show SoundCloud sign in`.
+4. Sign in inside the SoundCloud window.
+5. Close the window after the account page loads.
 
 You only need to sign in once. Closing the window hides it; the playback backend
 keeps running.

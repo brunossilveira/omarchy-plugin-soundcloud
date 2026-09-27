@@ -557,7 +557,7 @@ BarWidget {
           Text {
             width: parent.width
             textFormat: Text.PlainText
-            text: SoundCloudModel.pendingLabel(root.playbackState) || root.artist || (!root.running ? "Backend is stopped" : (!root.loggedIn ? "Sign in once to continue" : "Nothing playing"))
+            text: SoundCloudModel.pendingLabel(root.playbackState) || root.artist || (!root.running ? (root.launchingBackend ? "Connecting…" : "Not connected") : (!root.loggedIn ? "Sign in once to continue" : "Nothing playing"))
             color: root.dim
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -887,7 +887,7 @@ BarWidget {
 
       Text {
         width: parent.width
-        visible: !root.running || !root.loggedIn
+        visible: root.running && !root.loggedIn
         textFormat: Text.PlainText
         text: "A SoundCloud window opens. Sign in there once, then close it. Playback keeps running and you stay signed in."
         color: root.dim
@@ -900,10 +900,10 @@ BarWidget {
       Button {
         anchors.horizontalCenter: parent.horizontalCenter
         visible: !root.running || !root.loggedIn
-        text: root.running ? "Show SoundCloud sign in" : "Sign in to SoundCloud"
+        text: root.running ? "Show SoundCloud sign in" : "Connect"
         foreground: root.bar.foreground
         enabled: !root.actionBusy
-        onClicked: root.runAction(root.running ? "show" : "launch")
+        onClicked: root.runAction(root.running ? "show" : "ensure")
       }
 
       Text {
