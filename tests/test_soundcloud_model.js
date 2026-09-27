@@ -96,6 +96,11 @@ assert.equal(model.canStartAction(true, true, "next"), false);
 assert.equal(model.isCurrentSelectionResponse(42, 41), false);
 assert.equal(model.isCurrentSelectionResponse(42, 42), true);
 
+// The bar follows the theme palette: playback uses the theme accent, while
+// every non-playing state matches the other bar icons.
+assert.equal(model.barIconColor(true, "accent", "foreground"), "accent");
+assert.equal(model.barIconColor(false, "accent", "foreground"), "foreground");
+
 var requestEvents = [];
 function observeListEvent(reason, count, hasMore) {
   if (model.shouldLoadMoreTracks({

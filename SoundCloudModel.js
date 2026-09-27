@@ -86,6 +86,10 @@ function isCurrentSelectionResponse(activeRequestId, responseId) {
   return Number(activeRequestId) > 0 && Number(activeRequestId) === Number(responseId)
 }
 
+function barIconColor(playing, accent, foreground) {
+  return playing === true ? accent : foreground
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     searchablePlayerText: searchablePlayerText,
@@ -99,6 +103,7 @@ if (typeof module !== "undefined") {
     shouldPreservePlaybackMetadata: shouldPreservePlaybackMetadata,
     selectionIsPending: selectionIsPending,
     canStartAction: canStartAction,
-    isCurrentSelectionResponse: isCurrentSelectionResponse
+    isCurrentSelectionResponse: isCurrentSelectionResponse,
+    barIconColor: barIconColor
   }
 }

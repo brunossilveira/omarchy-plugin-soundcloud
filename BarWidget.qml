@@ -450,7 +450,7 @@ BarWidget {
       anchors.verticalCenter: parent.verticalCenter
       textFormat: Text.PlainText
       text: ""
-      color: root.running ? root.bar.barForeground : root.barDim
+      color: SoundCloudModel.barIconColor(root.playing, Color.accent, root.bar.barForeground)
       font.family: root.bar.fontFamily
       font.pixelSize: Style.font.body
     }
