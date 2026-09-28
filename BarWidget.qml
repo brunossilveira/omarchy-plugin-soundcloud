@@ -15,6 +15,8 @@ BarWidget {
   property bool playing: false
   property string playbackState: "idle"
   property string playbackId: ""
+  property bool liked: false
+  property bool likeBusy: false
   property string title: ""
   property string artist: ""
   property string artDataUrl: ""
@@ -197,6 +199,11 @@ BarWidget {
     }
   }
 
+  function toggleLike() {
+    if (likeBusy || playbackId === "") return
+    likeBusy = sendCommand((liked ? "unlike:" : "like:") + playbackId, "like") > 0
+  }
+
   function commandValue(action, value) {
     if (action === "launch") return "show"
     if (action === "seek") return "seek:" + String(value)
@@ -248,6 +255,7 @@ BarWidget {
     actionBusy = false
     selectionBusy = false
     activeSelectionRequestId = 0
+    likeBusy = false
   }
 
   function runAction(action, value) {
@@ -337,6 +345,7 @@ BarWidget {
       }
       title = incomingTitle
       playbackId = String(state.playbackId || "")
+      liked = state.liked === true
       artist = String(state.artist || "").slice(0, 256)
       waveformLevels = Array.isArray(state.waveform) ? state.waveform : []
     }
@@ -418,6 +427,10 @@ BarWidget {
         artworkData[artworkId] = trackArtDataUrl
         trackArtworkData = artworkData
       }
+    } else if (kind === "like") {
+      likeBusy = false
+      if (message.ok !== true) lastError = String(message.error || "SoundCloud could not update this like")
+      else if (SoundCloudModel.isCurrentTrack(message.playbackId, root.playbackId)) liked = message.liked === true
     } else if (kind === "action") {
       actionBusy = false
       if (message.ok !== true) lastError = String(message.error || "SoundCloud action failed")
@@ -543,6 +556,7 @@ BarWidget {
 
         Column {
           width: parent.width - Style.space(78)
+            - (likeButton.visible ? likeButton.width + parent.spacing : 0)
           anchors.verticalCenter: parent.verticalCenter
           spacing: Style.space(3)
 
@@ -565,6 +579,26 @@ BarWidget {
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.bodySmall
             elide: Text.ElideRight
+          }
+        }
+
+        Text {
+          id: likeButton
+          anchors.verticalCenter: parent.verticalCenter
+          visible: root.running && root.loggedIn && root.playbackId !== ""
+          textFormat: Text.PlainText
+          text: "󰋑"
+          color: root.liked ? Color.accent : root.bar.foreground
+          opacity: root.likeBusy ? 0.5 : 1
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.icon
+
+          MouseArea {
+            anchors.fill: parent
+            anchors.margins: -Style.space(4)
+            cursorShape: Qt.PointingHandCursor
+            enabled: !root.likeBusy
+            onClicked: root.toggleLike()
           }
         }
       }

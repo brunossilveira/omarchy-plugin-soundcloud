@@ -65,6 +65,8 @@ HLS_MAX_WORKERS = 2
 HLS_OPERATION_SECONDS = 45.0
 ARTWORK_HOSTS = {"i1.sndcdn.com"}
 MAX_WAVEFORM_BARS = 200
+# SoundCloud's bot protection (DataDome) shows its captcha in an iframe from here.
+BOT_CHECK_HOSTS = {"geo.captcha-delivery.com"}
 SOUNDCLOUD_WEB_HOSTS = {
     "soundcloud.com",
     "www.soundcloud.com",
@@ -534,6 +536,22 @@ def is_soundcloud_uri(uri: str) -> bool:
     return host in SOUNDCLOUD_WEB_HOSTS
 
 
+def is_bot_check_uri(uri: str) -> bool:
+    try:
+        parsed = urlparse(uri)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname is not None
+        and parsed.hostname.lower().rstrip(".") in BOT_CHECK_HOSTS
+        and parsed.username is None
+        and parsed.password is None
+        and port in (None, 443)
+    )
+
+
 def is_playback_id(value: object) -> bool:
     return isinstance(value, str) and re.fullmatch(r"soundcloud:tracks:[1-9][0-9]*", value) is not None
 
@@ -611,6 +629,24 @@ def playback_id_from_command(command: str) -> str | None:
         return None
     value = command.removeprefix("play:")
     return value if is_playback_id(value) else None
+
+
+def track_like_from_command(command: str) -> tuple[str, bool] | None:
+    for prefix, liked in (("like:", True), ("unlike:", False)):
+        if command.startswith(prefix):
+            value = command.removeprefix(prefix)
+            return (value, liked) if is_playback_id(value) else None
+    return None
+
+
+def oauth_token_from_cookies(records: list[dict[str, object]]) -> str | None:
+    for record in records:
+        domain = str(record.get("domain", "")).lower().lstrip(".").rstrip(".")
+        value = record.get("value")
+        if (record.get("name") == "oauth_token" and domain == "soundcloud.com"
+                and isinstance(value, str) and re.fullmatch(r"[0-9A-Za-z._-]{1,512}", value)):
+            return value
+    return None
 
 
 def merge_track_pages(
@@ -2017,6 +2053,155 @@ def hls_segment_urls(
     return resolved
 
 
+_api_opener = build_opener(ProxyHandler({}), _NoMediaRedirect)
+
+
+def soundcloud_api_request(method: str, path: str, token: str, maximum: int = 256 * 1024) -> object:
+    """Call SoundCloud's private web API directly with the signed-in session token."""
+    if not path.startswith("/") or method not in {"GET", "PUT", "DELETE"}:
+        raise ValueError("invalid API request")
+    request = Request(
+        "https://api-v2.soundcloud.com" + path,
+        method=method,
+        headers={
+            "Authorization": "OAuth " + token,
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        },
+    )
+    with _api_opener.open(request, timeout=10.0) as response:
+        data = response.read(maximum + 1)
+    if len(data) > maximum:
+        raise ValueError("API response too large")
+    return json.loads(data) if data.strip() else None
+
+
+class TrackLikes:
+    """The signed-in account's liked tracks, read over the private API.
+
+    Writes go through `write` because SoundCloud's bot protection rejects
+    like/unlike requests that do not come from its own web page.
+    """
+
+    RETRY_SECONDS = 60.0
+    MAX_LIKE_PAGES = 50
+
+    def __init__(self, load_token, write, request=soundcloud_api_request, spawn=None):
+        self.load_token = load_token
+        self.write = write
+        self.request = request
+        self.spawn = spawn or (lambda target: threading.Thread(target=target, daemon=True).start())
+        self.lock = threading.Lock()
+        self.token: str | None = None
+        self.user_id: int | None = None
+        self.liked_ids: set[int] | None = None
+        self.loading = False
+        self.last_attempt = -math.inf
+
+    def _session(self) -> str:
+        token = self.load_token()
+        if not token:
+            raise PermissionError("not signed in")
+        if token != self.token:
+            self.token, self.user_id, self.liked_ids = token, None, None
+        if self.user_id is None:
+            me = self.request("GET", "/me", token)
+            user_id = me.get("id") if isinstance(me, dict) else None
+            if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+                raise ValueError("invalid account response")
+            self.user_id = user_id
+        if self.liked_ids is None:
+            liked_ids = set()
+            path = "/me/track_likes/ids?limit=200"
+            # SoundCloud pages these 200 at a time; stop at 10,000 likes.
+            for _page in range(self.MAX_LIKE_PAGES):
+                payload = self.request("GET", path, token, 1024 * 1024)
+                ids = payload.get("collection") if isinstance(payload, dict) else None
+                if not isinstance(ids, list):
+                    raise ValueError("invalid likes response")
+                liked_ids.update(
+                    value for value in ids
+                    if isinstance(value, int) and not isinstance(value, bool) and value > 0
+                )
+                next_href = payload.get("next_href")
+                parsed = urlparse(next_href) if isinstance(next_href, str) else None
+                if (not ids or parsed is None or parsed.scheme != "https"
+                        or parsed.netloc != "api-v2.soundcloud.com"
+                        or parsed.path != "/me/track_likes/ids"):
+                    break
+                path = parsed.path + "?" + parsed.query
+            self.liked_ids = liked_ids
+        return token
+
+    def is_liked(self, track_id: int) -> bool | None:
+        liked_ids = self.liked_ids
+        return None if liked_ids is None else track_id in liked_ids
+
+    def load_in_background(self, on_loaded) -> None:
+        now = time.monotonic()
+        if self.liked_ids is not None or self.loading or now - self.last_attempt < self.RETRY_SECONDS:
+            return
+        self.loading = True
+        self.last_attempt = now
+
+        def worker():
+            try:
+                with self.lock:
+                    self._session()
+                on_loaded()
+            except (OSError, ValueError):
+                pass
+            finally:
+                self.loading = False
+
+        self.spawn(worker)
+
+    def set_liked(self, track_id: int, liked: bool) -> None:
+        with self.lock:
+            token = self._session()
+            self.write(cast(int, self.user_id), track_id, liked, token)
+            liked_ids = cast(set[int], self.liked_ids)
+            if liked:
+                liked_ids.add(track_id)
+            else:
+                liked_ids.discard(track_id)
+
+
+BOT_CHECK_MESSAGE = "SoundCloud wants a quick check. Solve it in the SoundCloud window, then tap the heart again."
+
+
+class BotCheckRequired(OSError):
+    """SoundCloud's bot protection answered with a captcha instead of the API."""
+
+
+# Runs in the SoundCloud page so its DataDome tag, which watches
+# /users/*/track_likes/*, vouches for the request and shows any captcha.
+LIKE_TRACK_FUNCTION = r"""
+  if (!Number.isSafeInteger(userId) || userId <= 0 || !Number.isSafeInteger(trackId) || trackId <= 0
+      || (method !== 'PUT' && method !== 'DELETE') || typeof token !== 'string') return 'failed';
+  const response = await fetch(
+    'https://api-v2.soundcloud.com/users/' + userId + '/track_likes/' + trackId,
+    {
+      method,
+      headers: { Authorization: 'OAuth ' + token },
+      credentials: 'include',
+      cache: 'no-store',
+      redirect: 'error'
+    }
+  );
+  if (response.ok) return 'ok';
+  if (response.status !== 403) return 'failed';
+  try {
+    const text = await response.text();
+    const url = new URL(text.length <= 4096 ? JSON.parse(text).url : '');
+    return url.protocol === 'https:' && url.hostname === 'geo.captcha-delivery.com'
+      ? 'bot-check' : 'failed';
+  } catch (_) {
+    return 'failed';
+  }
+"""
+
+
 class GstPlayback:
     def __init__(self, Gst, on_change, schedule=lambda callback, *args: callback(*args)):
         self.Gst = Gst
@@ -2562,6 +2747,10 @@ def build_application(show_on_start: bool = False):
                 ),
             )
             self.track_artwork_urls: OrderedDict[str, str] = OrderedDict()
+            self.track_likes = TrackLikes(
+                lambda: oauth_token_from_cookies(cookie_store.load()),
+                self._write_like_in_page,
+            )
             self.track_cache = track_cache
             self.playback_tracks = {
                 track["playbackId"]: track
@@ -2875,7 +3064,7 @@ def build_application(show_on_start: bool = False):
                 return False
             request = decision.get_request()
             uri = request.get_uri() if request else ""
-            if is_soundcloud_uri(uri):
+            if is_soundcloud_uri(uri) or is_bot_check_uri(uri):
                 decision.use()
             else:
                 decision.ignore()
@@ -2920,6 +3109,15 @@ def build_application(show_on_start: bool = False):
             state["artDataUrl"] = self.artwork_cache.get(
                 remote_art, self._artwork_ready_from_thread
             )
+            playback_id = str(state["playbackId"])
+            liked = None
+            if playback_id:
+                liked = self.track_likes.is_liked(int(playback_id.rpartition(":")[2]))
+                if liked is None and state["loggedIn"]:
+                    self.track_likes.load_in_background(
+                        lambda: GLib.idle_add(self._publish_status_once)
+                    )
+            state["liked"] = liked is True
             return state
 
         def _secure_tracks(self, payload):
@@ -3183,6 +3381,23 @@ def build_application(show_on_start: bool = False):
 
                 self._evaluate(script, track_selected)
                 GLib.timeout_add_seconds(15, self._resolution_timed_out, generation)
+            elif (like := track_like_from_command(command)) is not None:
+                playback_id, liked = like
+
+                def update_like():
+                    try:
+                        self.track_likes.set_liked(int(playback_id.rpartition(":")[2]), liked)
+                        payload = {"ok": True, "running": True, "playbackId": playback_id, "liked": liked}
+                    except BotCheckRequired:
+                        GLib.idle_add(self.show_login)
+                        payload = {"ok": False, "error": BOT_CHECK_MESSAGE}
+                    except (OSError, ValueError):
+                        payload = {"ok": False, "error": "SoundCloud could not update this like"}
+                    GLib.idle_add(
+                        lambda: self._respond(connection, request_id, payload, publish_status=True)
+                    )
+
+                threading.Thread(target=update_like, daemon=True).start()
             elif source_uri(command):
                 self._publish_cached_tracks(command)
                 self.webview.load_uri(source_uri(command))
@@ -3196,6 +3411,42 @@ def build_application(show_on_start: bool = False):
             else:
                 self._respond(connection, request_id, {"ok": False, "error": "unknown command"})
             return False
+
+        def _write_like_in_page(self, user_id, track_id, liked, token):
+            """Run on a worker thread; blocks until the page's fetch finishes."""
+            done = threading.Event()
+            result = {"outcome": "failed"}
+
+            def finished(webview, async_result, _data):
+                try:
+                    value = webview.call_async_javascript_function_finish(async_result)
+                    result["outcome"] = value.to_string() if value.is_string() else "failed"
+                except Exception:
+                    pass
+                done.set()
+
+            def start():
+                if not self.webview or not is_soundcloud_uri(self.webview.get_uri() or ""):
+                    done.set()
+                    return False
+                arguments = GLib.Variant("a{sv}", {
+                    "userId": GLib.Variant("d", user_id),
+                    "trackId": GLib.Variant("d", track_id),
+                    "method": GLib.Variant("s", "PUT" if liked else "DELETE"),
+                    "token": GLib.Variant("s", token),
+                })
+                self.webview.call_async_javascript_function(
+                    LIKE_TRACK_FUNCTION, -1, arguments, None, None, None, finished, None
+                )
+                return False
+
+            GLib.idle_add(start)
+            if not done.wait(15.0):
+                raise TimeoutError("like request timed out")
+            if result["outcome"] == "bot-check":
+                raise BotCheckRequired("SoundCloud asked for a captcha")
+            if result["outcome"] != "ok":
+                raise OSError("like request failed")
 
         def _evaluate(self, script, callback):
             if not self.webview or not is_soundcloud_uri(self.webview.get_uri() or ""):

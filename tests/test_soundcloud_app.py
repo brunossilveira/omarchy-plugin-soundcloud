@@ -231,6 +231,16 @@ class UriPolicyTest(unittest.TestCase):
         self.assertFalse(app.is_soundcloud_uri("https://user:pass@soundcloud.com/you/likes"))
         self.assertFalse(app.is_soundcloud_uri("https://soundcloud.com:8443/you/likes"))
 
+    def test_bot_check_captcha_can_load_but_nothing_else_off_soundcloud(self):
+        app = load_module()
+
+        # Blocking this iframe left the sign-in window blank when liking a track.
+        self.assertTrue(app.is_bot_check_uri("https://geo.captcha-delivery.com/captcha/?cid=x"))
+        self.assertFalse(app.is_bot_check_uri("http://geo.captcha-delivery.com/captcha/"))
+        self.assertFalse(app.is_bot_check_uri("https://geo.captcha-delivery.com.example.org/"))
+        self.assertFalse(app.is_bot_check_uri("https://user@geo.captcha-delivery.com/"))
+        self.assertFalse(app.is_bot_check_uri("https://example.org/captcha/"))
+
 
 class GraphicsWorkaroundTest(unittest.TestCase):
     def test_disables_webkit_dmabuf_on_hyprland(self):
@@ -1546,6 +1556,228 @@ eval({json.dumps(capture_script)});
         finally:
             release.set()
             cache.close()
+
+
+class FakeSoundCloudApi:
+    def __init__(self, user_id=42, liked_ids=(7,)):
+        self.user_id = user_id
+        self.liked_ids = list(liked_ids)
+        self.calls = []
+        self.fail_writes = False
+
+    def __call__(self, method, path, token, maximum=0):
+        self.calls.append((method, path, token))
+        if method == "GET" and path == "/me":
+            return {"id": self.user_id}
+        if method == "GET" and path.startswith("/me/track_likes/ids"):
+            offset = int(path.partition("offset=")[2] or 0)
+            page = self.liked_ids[offset:offset + 2]
+            next_href = (
+                f"https://api-v2.soundcloud.com/me/track_likes/ids?limit=2&offset={offset + 2}"
+                if offset + 2 < len(self.liked_ids) else None
+            )
+            return {"collection": page, "next_href": next_href}
+        raise AssertionError(f"unexpected API read {method} {path}")
+
+    def write(self, user_id, track_id, liked, token):
+        self.calls.append(("PUT" if liked else "DELETE", f"/users/{user_id}/track_likes/{track_id}", token))
+        if self.fail_writes:
+            raise OSError("like request failed with HTTP 403")
+
+
+class TrackLikesTest(unittest.TestCase):
+    def test_like_command_accepts_only_stable_soundcloud_track_ids(self):
+        app = load_module()
+
+        self.assertEqual(
+            app.track_like_from_command("like:soundcloud:tracks:123"),
+            ("soundcloud:tracks:123", True),
+        )
+        self.assertEqual(
+            app.track_like_from_command("unlike:soundcloud:tracks:123"),
+            ("soundcloud:tracks:123", False),
+        )
+        self.assertIsNone(app.track_like_from_command("like:soundcloud:tracks:0"))
+        self.assertIsNone(app.track_like_from_command("like:soundcloud:users:123"))
+        self.assertIsNone(app.track_like_from_command("like:soundcloud:tracks:1/../../me"))
+
+    def test_session_token_comes_only_from_the_soundcloud_oauth_cookie(self):
+        app = load_module()
+        cookie = {"name": "oauth_token", "value": "2-1-abc", "domain": "soundcloud.com", "path": "/"}
+
+        self.assertEqual(app.oauth_token_from_cookies([cookie]), "2-1-abc")
+        self.assertIsNone(app.oauth_token_from_cookies([{**cookie, "domain": "api-auth.soundcloud.com"}]))
+        self.assertIsNone(app.oauth_token_from_cookies([{**cookie, "name": "connect_session"}]))
+        # A header-injecting value must never reach the Authorization header.
+        self.assertIsNone(app.oauth_token_from_cookies([{**cookie, "value": "abc\r\nX-Evil: 1"}]))
+
+    def test_liking_writes_to_the_signed_in_users_likes_and_updates_state(self):
+        app = load_module()
+        api = FakeSoundCloudApi(user_id=42, liked_ids=[7])
+        likes = app.TrackLikes(lambda: "token", api.write, request=api)
+
+        likes.set_liked(99, True)
+
+        self.assertIn(("PUT", "/users/42/track_likes/99", "token"), api.calls)
+        self.assertTrue(likes.is_liked(99))
+        self.assertTrue(likes.is_liked(7))
+
+        likes.set_liked(7, False)
+
+        self.assertIn(("DELETE", "/users/42/track_likes/7", "token"), api.calls)
+        self.assertFalse(likes.is_liked(7))
+
+    def test_likes_beyond_the_first_page_show_as_liked(self):
+        app = load_module()
+        api = FakeSoundCloudApi(liked_ids=[1, 2, 3, 4, 5])
+        likes = app.TrackLikes(lambda: "token", api.write, request=api, spawn=lambda target: target())
+
+        likes.load_in_background(lambda: None)
+
+        self.assertTrue(likes.is_liked(5))
+        self.assertFalse(likes.is_liked(6))
+
+    def test_likes_paging_never_follows_a_cursor_off_soundcloud(self):
+        app = load_module()
+        calls = []
+
+        def request(method, path, token, maximum=0):
+            calls.append(path)
+            if path == "/me":
+                return {"id": 1}
+            return {"collection": [7], "next_href": "https://evil.example/me/track_likes/ids?offset=1"}
+
+        likes = app.TrackLikes(lambda: "token", None, request=request, spawn=lambda target: target())
+        likes.load_in_background(lambda: None)
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(likes.is_liked(7))
+
+    def test_failed_write_keeps_the_previous_liked_state(self):
+        app = load_module()
+        api = FakeSoundCloudApi(liked_ids=[7])
+        likes = app.TrackLikes(lambda: "token", api.write, request=api)
+        api.fail_writes = True
+
+        with self.assertRaises(OSError):
+            likes.set_liked(7, False)
+
+        self.assertTrue(likes.is_liked(7))
+
+    def test_likes_are_unknown_until_loaded_and_signed_out_never_calls_the_api(self):
+        app = load_module()
+        api = FakeSoundCloudApi()
+        likes = app.TrackLikes(lambda: None, api.write, request=api, spawn=lambda target: target())
+
+        self.assertIsNone(likes.is_liked(7))
+        with self.assertRaises(PermissionError):
+            likes.set_liked(7, True)
+        likes.load_in_background(lambda: None)
+
+        self.assertEqual(api.calls, [])
+        self.assertIsNone(likes.is_liked(7))
+
+    def test_background_load_retries_are_throttled(self):
+        app = load_module()
+        api = FakeSoundCloudApi()
+        api.user_id = 0  # invalid account response
+        likes = app.TrackLikes(lambda: "token", api.write, request=api, spawn=lambda target: target())
+
+        likes.load_in_background(lambda: None)
+        likes.load_in_background(lambda: None)
+
+        self.assertEqual(len(api.calls), 1)
+
+    def test_switching_accounts_drops_the_previous_accounts_likes(self):
+        app = load_module()
+        api = FakeSoundCloudApi(user_id=1, liked_ids=[7])
+        token = ["first"]
+        likes = app.TrackLikes(lambda: token[0], api.write, request=api)
+        likes.set_liked(8, True)
+
+        token[0] = "second"
+        api.user_id, api.liked_ids = 2, []
+        likes.set_liked(9, True)
+
+        self.assertIn(("PUT", "/users/2/track_likes/9", "second"), api.calls)
+        self.assertFalse(likes.is_liked(7))
+
+    def run_like_function(self, responses, method="PUT"):
+        app = load_module()
+        harness = f"""
+const responses = {json.dumps(responses)};
+const requests = [];
+global.fetch = async (url, init) => {{
+  requests.push({{ url, method: init.method, auth: init.headers.Authorization }});
+  const next = responses.shift();
+  return new Response(next.body, {{ status: next.status }});
+}};
+(async () => {{
+  const outcomes = [];
+  for (let index = 0; index < {len(responses)}; index++) {{
+    outcomes.push(await (async (userId, trackId, method, token) => {{
+      {app.LIKE_TRACK_FUNCTION}
+    }})(42, 99, {json.dumps(method)}, 'token'));
+  }}
+  process.stdout.write(JSON.stringify({{ outcomes, requests }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+        completed = subprocess.run(["node", "-e", harness], check=True, capture_output=True, text=True)
+        return json.loads(completed.stdout)
+
+    def test_page_like_reports_a_captcha_so_the_user_can_be_sent_to_solve_it(self):
+        captcha = json.dumps({"url": "https://geo.captcha-delivery.com/captcha/?cid=x"})
+        lookalike = json.dumps({"url": "https://geo.captcha-delivery.com.example.org/captcha/"})
+
+        result = self.run_like_function([
+            {"status": 200, "body": ""},
+            {"status": 403, "body": captcha},
+            {"status": 403, "body": lookalike},
+            {"status": 403, "body": "{}"},
+            {"status": 500, "body": captcha},
+        ])
+
+        self.assertEqual(result["outcomes"], ["ok", "bot-check", "failed", "failed", "failed"])
+        self.assertEqual(result["requests"][0], {
+            "url": "https://api-v2.soundcloud.com/users/42/track_likes/99",
+            "method": "PUT",
+            "auth": "OAuth token",
+        })
+
+    def test_page_like_refuses_methods_other_than_like_and_unlike(self):
+        result = self.run_like_function([{"status": 200, "body": ""}], method="POST")
+
+        self.assertEqual(result["outcomes"], ["failed"])
+        self.assertEqual(result["requests"], [])
+
+    def test_api_requests_go_only_to_soundcloud_without_proxies_or_redirects(self):
+        app = load_module()
+        seen = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _size):
+                return b'{"id": 1}'
+
+        def fake_open(request, timeout):
+            seen.append(request)
+            return Response()
+
+        with mock.patch.object(app._api_opener, "open", side_effect=fake_open):
+            self.assertEqual(app.soundcloud_api_request("GET", "/me", "token"), {"id": 1})
+            with self.assertRaises(ValueError):
+                app.soundcloud_api_request("GET", "@evil.example/me", "token")
+
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].full_url, "https://api-v2.soundcloud.com/me")
+        self.assertEqual(seen[0].get_header("Authorization"), "OAuth token")
+        handler_types = {type(handler) for handler in app._api_opener.handlers}
+        self.assertIn(app._NoMediaRedirect, handler_types)
 
 
 class CheckResultTest(unittest.TestCase):

@@ -13,6 +13,7 @@ without official SoundCloud API credentials.
 - Current track, artist, and artwork, with the bar icon highlighted during playback
 - Play/pause, previous, and next controls
 - SoundCloud-style waveform progress display with click-to-seek
+- Heart button to like or unlike the current track on your SoundCloud account
 - Home and Feed tabs that load more tracks as you scroll
 - Persistent SoundCloud login session
 - Local audio playback through GStreamer
@@ -78,6 +79,8 @@ keeps running.
   command it shows, then select Connect again.
 - Nothing plays: run `python3 soundcloud_app.py check` and install any missing
   GStreamer plugins.
+- The heart opens the SoundCloud window: SoundCloud's bot protection wants a
+  captcha. Solve it in that window, close it, then tap the heart again.
 - Lists or playback stop working: SoundCloud may have changed its private web API.
   Stop the backend with `python3 soundcloud_app.py stop` and open the popup again
   to relaunch it. If that does not help, please open an issue.
