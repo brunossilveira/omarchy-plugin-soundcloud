@@ -124,6 +124,13 @@ the authenticated web app's private JSON APIs through an isolated WebKit view.
 Selecting a track resolves its stable track ID to a short-lived media URL for the
 local GStreamer player. These private API schemas can change without notice.
 
+- **History** shows what SoundCloud has recorded. In testing, tracks played in this
+  plugin did not appear in SoundCloud's history, so they are missing from the History tab
+  until you play them elsewhere. Plays on the SoundCloud website or your phone appear as
+  usual.
+- Some tracks, mostly ad-supported ones, only offer encrypted streams. The plugin cannot
+  play those, so selecting one shows an error.
+
 ## How it works
 
 A hidden, sandboxed WebKitGTK view stays signed in to soundcloud.com. The backend
