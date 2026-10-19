@@ -2180,6 +2180,16 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn('onClicked: root.selectTab("likes")', qml)
         self.assertIn("if (!isAccountTab(tab)) runAction(tab)", qml)
 
+    def test_library_link_opens_the_soundcloud_library_in_the_browser_apart_from_the_tabs(self):
+        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+
+        self.assertLess(qml.index('text: "History"'), qml.index('text: "Library'))
+        self.assertIn(
+            'Quickshell.execDetached(["omarchy", "launch", "browser", "https://soundcloud.com/you/library"])',
+            qml,
+        )
+        self.assertNotIn("selectTab(\"library\")", qml)
+
     def test_history_tab_follows_likes_and_reads_from_the_account_api(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
 

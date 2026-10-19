@@ -73,6 +73,7 @@ keeps running.
 - Mouse wheel: previous/next
 - Popup: artwork, metadata, playback controls, and a seekable waveform
 - Home, Feed, Likes, and History tabs: click a track to play it
+- Library link: opens your SoundCloud Library in the default browser
 
 ## Troubleshooting
 

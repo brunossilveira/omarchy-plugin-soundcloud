@@ -785,40 +785,58 @@ BarWidget {
         }
       }
 
-      Row {
-        spacing: Style.space(8)
+      Item {
+        width: parent.width
+        height: tabRow.implicitHeight
         visible: root.running && root.loggedIn
 
-        Button {
-          text: "Home"
-          foreground: root.bar.foreground
-          enabled: !root.actionBusy
-          selected: root.selectedTab === "home"
-          onClicked: root.selectTab("home")
+        Row {
+          id: tabRow
+          spacing: Style.space(8)
+
+          Button {
+            text: "Home"
+            foreground: root.bar.foreground
+            enabled: !root.actionBusy
+            selected: root.selectedTab === "home"
+            onClicked: root.selectTab("home")
+          }
+
+          Button {
+            text: "Feed"
+            foreground: root.bar.foreground
+            enabled: !root.actionBusy
+            selected: root.selectedTab === "feed"
+            onClicked: root.selectTab("feed")
+          }
+
+          Button {
+            text: "Likes"
+            foreground: root.bar.foreground
+            enabled: !root.actionBusy
+            selected: root.selectedTab === "likes"
+            onClicked: root.selectTab("likes")
+          }
+
+          Button {
+            text: "History"
+            foreground: root.bar.foreground
+            enabled: !root.actionBusy
+            selected: root.selectedTab === "history"
+            onClicked: root.selectTab("history")
+          }
         }
 
+        // Opens SoundCloud's Library in the browser, so it sits apart from the in-popup tabs.
         Button {
-          text: "Feed"
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(6)
+          text: "Library ↗"
           foreground: root.bar.foreground
-          enabled: !root.actionBusy
-          selected: root.selectedTab === "feed"
-          onClicked: root.selectTab("feed")
-        }
-
-        Button {
-          text: "Likes"
-          foreground: root.bar.foreground
-          enabled: !root.actionBusy
-          selected: root.selectedTab === "likes"
-          onClicked: root.selectTab("likes")
-        }
-
-        Button {
-          text: "History"
-          foreground: root.bar.foreground
-          enabled: !root.actionBusy
-          selected: root.selectedTab === "history"
-          onClicked: root.selectTab("history")
+          onClicked: {
+            Quickshell.execDetached(["omarchy", "launch", "browser", "https://soundcloud.com/you/library"])
+            root.close()
+          }
         }
       }
 
