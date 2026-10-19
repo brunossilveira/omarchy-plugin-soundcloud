@@ -31,17 +31,24 @@ BarWidget {
   property var tracks: []
   property var homeTracks: []
   property var feedTracks: []
+  property var likesTracks: []
+  property var historyTracks: []
   property var trackArtworkData: ({})
   property var trackArtworkPending: ({})
   property bool tracksLoading: false
   property bool homeLoadMorePending: false
   property bool feedLoadMorePending: false
-  readonly property bool loadMorePending: selectedTab === "home"
-    ? homeLoadMorePending : feedLoadMorePending
+  property bool likesLoadMorePending: false
+  property bool historyLoadMorePending: false
+  readonly property bool loadMorePending: loadMorePendingFor(selectedTab)
   property bool homeHasMore: true
   property bool feedHasMore: true
+  property bool likesHasMore: true
+  property bool historyHasMore: true
   property int homeLoadMoreAtCount: 0
   property int feedLoadMoreAtCount: 0
+  property int likesLoadMoreAtCount: 0
+  property int historyLoadMoreAtCount: 0
   property int trackLoadAttempts: 0
   property bool tracksRequestPending: false
   property int nextRequestId: 1
@@ -109,18 +116,60 @@ BarWidget {
     tracksRequestPending = sendCommand("tracks:" + selectedTab, "tracks:" + selectedTab) > 0
   }
 
+  // Likes and History are read from the SoundCloud account API by the backend,
+  // not from the hidden page, so selecting them never navigates it.
+  function isAccountTab(tab) { return tab === "likes" || tab === "history" }
+
+  function tabLabel(tab) {
+    return tab === "home" ? "Home" : (tab === "likes" ? "Likes" : (tab === "history" ? "History" : "Feed"))
+  }
+
+  function tracksFor(tab) {
+    return tab === "home" ? homeTracks : (tab === "likes" ? likesTracks
+      : (tab === "history" ? historyTracks : feedTracks))
+  }
+
+  function loadMorePendingFor(tab) {
+    return tab === "home" ? homeLoadMorePending : (tab === "likes" ? likesLoadMorePending
+      : (tab === "history" ? historyLoadMorePending : feedLoadMorePending))
+  }
+
+  function loadMoreAtCountFor(tab) {
+    return tab === "home" ? homeLoadMoreAtCount : (tab === "likes" ? likesLoadMoreAtCount
+      : (tab === "history" ? historyLoadMoreAtCount : feedLoadMoreAtCount))
+  }
+
+  function hasMoreFor(tab) {
+    return tab === "home" ? homeHasMore : (tab === "likes" ? likesHasMore
+      : (tab === "history" ? historyHasMore : feedHasMore))
+  }
+
+  function setLoadMoreAtCount(tab, count) {
+    if (tab === "home") homeLoadMoreAtCount = count
+    else if (tab === "feed") feedLoadMoreAtCount = count
+    else if (tab === "likes") likesLoadMoreAtCount = count
+    else if (tab === "history") historyLoadMoreAtCount = count
+  }
+
+  function setHasMore(tab, hasMore) {
+    if (tab === "home") homeHasMore = hasMore
+    else if (tab === "feed") feedHasMore = hasMore
+    else if (tab === "likes") likesHasMore = hasMore
+    else if (tab === "history") historyHasMore = hasMore
+  }
+
   function selectTab(tab) {
     selectedTab = tab
-    tracks = tab === "home" ? homeTracks : feedTracks
+    tracks = tracksFor(tab)
     tracksLoading = true
     trackLoadAttempts = 0
-    runAction(tab)
+    if (!isAccountTab(tab)) runAction(tab)
     refreshTracks()
   }
 
   function loadMoreTracks(yPosition, heightRatio, atEnd, userInitiated) {
-    var requestedCount = selectedTab === "home" ? homeLoadMoreAtCount : feedLoadMoreAtCount
-    var hasMore = selectedTab === "home" ? homeHasMore : feedHasMore
+    var requestedCount = loadMoreAtCountFor(selectedTab)
+    var hasMore = hasMoreFor(selectedTab)
     if (!backendConnected || !running || !loggedIn
         || !SoundCloudModel.shouldLoadMoreTracks({
           userInitiated: userInitiated,
@@ -132,13 +181,8 @@ BarWidget {
           requestedCount: requestedCount,
           pending: loadMorePending
         })) return
-    if (selectedTab === "home") {
-      homeLoadMorePending = true
-      homeLoadMoreAtCount = tracks.length
-    } else {
-      feedLoadMorePending = true
-      feedLoadMoreAtCount = tracks.length
-    }
+    setLoadMorePending(selectedTab, true)
+    setLoadMoreAtCount(selectedTab, tracks.length)
     if (sendCommand("load-more:" + selectedTab, "load-more:" + selectedTab) === 0) {
       setLoadMorePending(selectedTab, false)
     }
@@ -147,10 +191,12 @@ BarWidget {
   function setLoadMorePending(sourceTab, pending) {
     if (sourceTab === "home") homeLoadMorePending = pending
     else if (sourceTab === "feed") feedLoadMorePending = pending
+    else if (sourceTab === "likes") likesLoadMorePending = pending
+    else if (sourceTab === "history") historyLoadMorePending = pending
   }
 
   function applyTracks(result, sourceTab) {
-    var cached = sourceTab === "home" ? homeTracks : feedTracks
+    var cached = tracksFor(sourceTab)
     var applied = SoundCloudModel.applyTrackResult(cached, result)
     var previousContentY = selectedTab === sourceTab && result && result.reset !== true
       ? SoundCloudModel.contentYAfterTrackUpdate(
@@ -159,6 +205,8 @@ BarWidget {
     if (!result || result.pending !== true) {
       if (sourceTab === "home") homeTracks = applied.tracks
       else if (sourceTab === "feed") feedTracks = applied.tracks
+      else if (sourceTab === "likes") likesTracks = applied.tracks
+      else if (sourceTab === "history") historyTracks = applied.tracks
     }
     if (selectedTab === sourceTab) tracks = applied.tracks
     if (previousContentY !== null) {
@@ -170,16 +218,10 @@ BarWidget {
       })
     }
     if (result && result.hasMore === false) {
-      if (sourceTab === "home") homeHasMore = false
-      else if (sourceTab === "feed") feedHasMore = false
+      setHasMore(sourceTab, false)
     } else if (result && result.reset === true) {
-      if (sourceTab === "home") {
-        homeHasMore = true
-        homeLoadMoreAtCount = 0
-      } else if (sourceTab === "feed") {
-        feedHasMore = true
-        feedLoadMoreAtCount = 0
-      }
+      setHasMore(sourceTab, true)
+      setLoadMoreAtCount(sourceTab, 0)
     }
     if (result && result.error) lastError = String(result.error)
     if (selectedTab === sourceTab) tracksLoading = applied.loading
@@ -237,7 +279,7 @@ BarWidget {
     sendCommand("subscribe", "subscribe")
     sendCommand("status", "status")
     if (popupOpen && running && loggedIn) {
-      sendCommand(selectedTab, "action")
+      if (!isAccountTab(selectedTab)) sendCommand(selectedTab, "action")
       trackReloadTimer.restart()
     }
   }
@@ -249,6 +291,8 @@ BarWidget {
     tracksRequestPending = false
     homeLoadMorePending = false
     feedLoadMorePending = false
+    likesLoadMorePending = false
+    historyLoadMorePending = false
     trackArtworkPending = ({})
     tracksLoading = false
     trackLoadAttempts = 0
@@ -350,7 +394,7 @@ BarWidget {
       waveformLevels = Array.isArray(state.waveform) ? state.waveform : []
     }
     if (popupOpen && loggedIn && !wasLoggedIn && tracks.length === 0) {
-      sendCommand(selectedTab, "action")
+      if (!isAccountTab(selectedTab)) sendCommand(selectedTab, "action")
       trackReloadTimer.restart()
     }
   }
@@ -375,8 +419,7 @@ BarWidget {
       var messageSource = String(message.source || "")
       setLoadMorePending(messageSource, false)
       if (message.error && Number(message.addedCount || 0) === 0) {
-        if (messageSource === "home") homeLoadMoreAtCount = 0
-        else if (messageSource === "feed") feedLoadMoreAtCount = 0
+        setLoadMoreAtCount(messageSource, 0)
       }
       applyTracks(message, messageSource)
       if (message.cached !== true) trackLoadAttempts = 50
@@ -402,17 +445,10 @@ BarWidget {
       var requestedSource = kind.substring(10)
       if (message.started !== true) {
         setLoadMorePending(requestedSource, false)
-        if (requestedSource === "home") homeLoadMoreAtCount = 0
-        else if (requestedSource === "feed") feedLoadMoreAtCount = 0
+        setLoadMoreAtCount(requestedSource, 0)
       }
-      if (message.hasMore === false) {
-        if (requestedSource === "home") homeHasMore = false
-        else if (requestedSource === "feed") feedHasMore = false
-      }
-      if (message.ok !== true) {
-        if (requestedSource === "home") homeLoadMoreAtCount = 0
-        else if (requestedSource === "feed") feedLoadMoreAtCount = 0
-      }
+      if (message.hasMore === false) setHasMore(requestedSource, false)
+      if (message.ok !== true) setLoadMoreAtCount(requestedSource, 0)
     } else if (kind && kind.indexOf("artwork:") === 0) {
       var artworkId = kind.substring(8)
       var pendingArtwork = Object.assign({}, trackArtworkPending)
@@ -768,6 +804,22 @@ BarWidget {
           selected: root.selectedTab === "feed"
           onClicked: root.selectTab("feed")
         }
+
+        Button {
+          text: "Likes"
+          foreground: root.bar.foreground
+          enabled: !root.actionBusy
+          selected: root.selectedTab === "likes"
+          onClicked: root.selectTab("likes")
+        }
+
+        Button {
+          text: "History"
+          foreground: root.bar.foreground
+          enabled: !root.actionBusy
+          selected: root.selectedTab === "history"
+          onClicked: root.selectTab("history")
+        }
       }
 
       Item {
@@ -937,7 +989,7 @@ BarWidget {
           anchors.centerIn: parent
           visible: root.tracksLoading && root.tracks.length === 0
           textFormat: Text.PlainText
-          text: "Loading " + (root.selectedTab === "home" ? "Home" : "Feed") + "…"
+          text: "Loading " + root.tabLabel(root.selectedTab) + "…"
           color: root.dim
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.body

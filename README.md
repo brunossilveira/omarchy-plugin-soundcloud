@@ -15,6 +15,7 @@ without official SoundCloud API credentials.
 - SoundCloud-style waveform progress display with click-to-seek
 - Heart button to like or unlike the current track on your SoundCloud account
 - Home and Feed tabs that load more tracks as you scroll
+- Likes and Play history tabs for your account, newest first, that load more as you scroll
 - Persistent SoundCloud login session
 - Local audio playback through GStreamer
 
@@ -71,7 +72,7 @@ keeps running.
 - Right-click: next track
 - Mouse wheel: previous/next
 - Popup: artwork, metadata, playback controls, and a seekable waveform
-- Home and Feed tabs: click a track to play it
+- Home, Feed, Likes, and History tabs: click a track to play it
 
 ## Troubleshooting
 
@@ -134,6 +135,11 @@ widget talks to the backend over a private Unix socket.
   survives shell restarts.
 - The backend stops when the plugin is removed, or 10 seconds after the bar widget
   disconnects.
+- Likes and History are read by the backend straight from SoundCloud's account API
+  (`/users/{id}/track_likes` and `/me/play-history/tracks`) with the session token, a
+  page at a time (24), and cached like the other lists. The hidden page is kept on Home
+  or Feed while they are open, because playing a track needs the request context the page
+  records there.
 - Home and Feed are built from the SoundCloud page's own API responses and
   paginated through SoundCloud's API cursors. Each list keeps at most 100 tracks
   and is cached so the popup has content right after a restart.
