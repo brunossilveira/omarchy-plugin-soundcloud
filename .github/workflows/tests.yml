@@ -11,9 +11,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.14"
+      # The dependency check test needs the real GTK, WebKit and GStreamer
+      # libraries, which only the system Python can import.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1 \
+            gir1.2-gstreamer-1.0 gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good gstreamer1.0-libav
       - uses: actions/setup-node@v6
         with:
           node-version: "26"
