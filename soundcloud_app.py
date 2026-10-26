@@ -644,7 +644,7 @@ def oauth_token_from_cookies(records: list[dict[str, object]]) -> str | None:
         domain = str(record.get("domain", "")).lower().lstrip(".").rstrip(".")
         value = record.get("value")
         if (record.get("name") == "oauth_token" and domain == "soundcloud.com"
-                and isinstance(value, str) and re.fullmatch(r"[0-9A-Za-z._-]{1,512}", value)):
+                and isinstance(value, str) and re.fullmatch(r"[0-9A-Za-z._-]{1,2048}", value)):
             return value
     return None
 

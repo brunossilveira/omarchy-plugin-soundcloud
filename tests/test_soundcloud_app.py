@@ -1608,6 +1608,10 @@ class TrackLikesTest(unittest.TestCase):
         self.assertEqual(app.oauth_token_from_cookies([cookie]), "2-1-abc")
         self.assertIsNone(app.oauth_token_from_cookies([{**cookie, "domain": "api-auth.soundcloud.com"}]))
         self.assertIsNone(app.oauth_token_from_cookies([{**cookie, "name": "connect_session"}]))
+        # Current SoundCloud tokens are far longer than the original 512 character cap.
+        long_token = "2-" + "a" * 850
+        self.assertEqual(app.oauth_token_from_cookies([{**cookie, "value": long_token}]), long_token)
+        self.assertIsNone(app.oauth_token_from_cookies([{**cookie, "value": "a" * 2049}]))
         # A header-injecting value must never reach the Authorization header.
         self.assertIsNone(app.oauth_token_from_cookies([{**cookie, "value": "abc\r\nX-Evil: 1"}]))
 
