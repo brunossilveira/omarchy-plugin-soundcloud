@@ -1559,9 +1559,11 @@ eval({json.dumps(capture_script)});
 
 
 class FakeSoundCloudApi:
-    def __init__(self, user_id=42, liked_ids=(7,)):
+    def __init__(self, user_id=42, liked_ids=(7,), like_items=(), history_items=()):
         self.user_id = user_id
         self.liked_ids = list(liked_ids)
+        self.like_items = list(like_items)
+        self.history_items = list(history_items)
         self.calls = []
         self.fail_writes = False
 
@@ -1577,12 +1579,231 @@ class FakeSoundCloudApi:
                 if offset + 2 < len(self.liked_ids) else None
             )
             return {"collection": page, "next_href": next_href}
+        if method == "GET" and path.startswith(f"/users/{self.user_id}/track_likes?"):
+            offset = int(path.partition("offset=")[2] or 0)
+            page = self.like_items[offset:offset + 2]
+            next_href = (
+                f"https://api-v2.soundcloud.com/users/{self.user_id}/track_likes?limit=2&offset={offset + 2}"
+                if offset + 2 < len(self.like_items) else None
+            )
+            return {"collection": page, "next_href": next_href}
+        if method == "GET" and path.startswith("/me/play-history/tracks?"):
+            offset = int(path.partition("offset=")[2] or 0)
+            page = self.history_items[offset:offset + 2]
+            next_href = (
+                f"https://api-v2.soundcloud.com/me/play-history/tracks?limit=2&offset={offset + 2}"
+                if offset + 2 < len(self.history_items) else None
+            )
+            return {"collection": page, "next_href": next_href}
         raise AssertionError(f"unexpected API read {method} {path}")
 
     def write(self, user_id, track_id, liked, token):
         self.calls.append(("PUT" if liked else "DELETE", f"/users/{user_id}/track_likes/{track_id}", token))
         if self.fail_writes:
             raise OSError("like request failed with HTTP 403")
+
+
+def like_item(track_id, **overrides):
+    track = {
+        "id": track_id,
+        "title": f"Song {track_id}",
+        "duration": 180000,
+        "permalink_url": f"https://soundcloud.com/artist/song-{track_id}",
+        "artwork_url": "https://i1.sndcdn.com/artworks-abc-large.jpg",
+        "playback_count": 12,
+        "user": {"username": "Artist"},
+    }
+    track.update(overrides)
+    return {"kind": "like", "created_at": "2026-10-01T00:00:00Z", "track": track}
+
+
+class LikedTracksTest(unittest.TestCase):
+    def test_like_entries_become_playable_track_rows(self):
+        app = load_module()
+
+        row = app.track_from_entry(like_item(123))
+
+        self.assertEqual(row, {
+            "playbackId": "soundcloud:tracks:123",
+            "title": "Song 123",
+            "artist": "Artist",
+            "url": "https://soundcloud.com/artist/song-123",
+            "artUrl": "https://i1.sndcdn.com/artworks-abc-large.jpg",
+            "playCount": 12,
+            "durationMs": 180000,
+        })
+        # The row must survive the same validation the Home and Feed lists get.
+        self.assertEqual(len(app.validate_tracks_payload({"tracks": [row]})["tracks"]), 1)
+
+    def test_like_rows_fall_back_to_the_uploader_avatar_and_publisher_artist(self):
+        app = load_module()
+        item = like_item(5, artwork_url=None, user={"avatar_url": "https://i1.sndcdn.com/avatar.jpg"},
+                         publisher_metadata={"artist": "Credited"})
+
+        row = app.track_from_entry(item)
+
+        self.assertEqual(row["artUrl"], "https://i1.sndcdn.com/avatar.jpg")
+        self.assertEqual(row["artist"], "Credited")
+
+    def test_unusable_like_entries_are_skipped(self):
+        app = load_module()
+
+        self.assertIsNone(app.track_from_entry(None))
+        self.assertIsNone(app.track_from_entry({"kind": "like", "track": None}))
+        self.assertIsNone(app.track_from_entry(like_item(0)))
+        self.assertIsNone(app.track_from_entry(like_item(True)))
+        self.assertIsNone(app.track_from_entry(like_item(7, title="  ")))
+        self.assertIsNone(app.track_from_entry(like_item(7, duration=None)))
+        self.assertIsNone(app.track_from_entry(like_item(7, permalink_url="")))
+
+    def test_oversized_like_fields_are_truncated_instead_of_rejecting_the_page(self):
+        app = load_module()
+
+        row = app.track_from_entry(like_item(9, title="t" * 2000, user={"username": "a" * 2000}))
+
+        self.assertEqual(len(row["title"]), 512)
+        self.assertEqual(len(row["artist"]), 256)
+        self.assertEqual(len(app.validate_tracks_payload({"tracks": [row]})["tracks"]), 1)
+
+    def test_liked_tracks_load_newest_first_page_by_page(self):
+        app = load_module()
+        api = FakeSoundCloudApi(user_id=42, like_items=[like_item(n) for n in (1, 2, 3)])
+        likes = app.TrackLikes(lambda: "token", api.write, request=api)
+
+        first, cursor = likes.tracks_page("likes")
+        second, last = likes.tracks_page("likes", cursor)
+
+        self.assertEqual([t["playbackId"] for t in first], ["soundcloud:tracks:1", "soundcloud:tracks:2"])
+        self.assertEqual([t["playbackId"] for t in second], ["soundcloud:tracks:3"])
+        self.assertIsNone(last)
+        self.assertEqual(
+            [path for _method, path, _token in api.calls if "track_likes" in path],
+            [
+                "/users/42/track_likes?limit=24",
+                "/users/42/track_likes?limit=2&offset=2",
+            ],
+        )
+
+    def test_liked_tracks_do_not_load_every_liked_id_first(self):
+        app = load_module()
+        api = FakeSoundCloudApi(like_items=[like_item(1)])
+        likes = app.TrackLikes(lambda: "token", api.write, request=api)
+
+        likes.tracks_page("likes")
+
+        self.assertFalse(any("track_likes/ids" in path for _method, path, _token in api.calls))
+
+    def test_liked_tracks_skip_unusable_entries_but_keep_paging(self):
+        app = load_module()
+        api = FakeSoundCloudApi(like_items=[{"kind": "like", "track": None}, like_item(2)])
+        likes = app.TrackLikes(lambda: "token", api.write, request=api)
+
+        tracks, cursor = likes.tracks_page("likes")
+
+        self.assertEqual([t["playbackId"] for t in tracks], ["soundcloud:tracks:2"])
+        self.assertIsNone(cursor)
+
+    def test_liked_tracks_never_follow_a_cursor_off_soundcloud_or_to_another_path(self):
+        app = load_module()
+        for next_href in (
+            "https://evil.example/users/1/track_likes?offset=2",
+            "http://api-v2.soundcloud.com/users/1/track_likes?offset=2",
+            "https://api-v2.soundcloud.com/users/2/track_likes?offset=2",
+            "https://api-v2.soundcloud.com/me/track_likes/ids?offset=2",
+            None,
+        ):
+            def request(method, path, token, maximum=0, next_href=next_href):
+                if path == "/me":
+                    return {"id": 1}
+                return {"collection": [like_item(3)], "next_href": next_href}
+
+            likes = app.TrackLikes(lambda: "token", None, request=request)
+
+            _tracks, cursor = likes.tracks_page("likes")
+
+            self.assertIsNone(cursor, next_href)
+
+    def test_signed_out_liked_tracks_never_call_the_api(self):
+        app = load_module()
+        api = FakeSoundCloudApi(like_items=[like_item(1)])
+        likes = app.TrackLikes(lambda: None, api.write, request=api)
+
+        with self.assertRaises(PermissionError):
+            likes.tracks_page("likes")
+
+        self.assertEqual(api.calls, [])
+
+    def test_invalid_likes_response_is_an_error(self):
+        app = load_module()
+
+        def request(method, path, token, maximum=0):
+            return {"id": 1} if path == "/me" else {"collection": "nope"}
+
+        likes = app.TrackLikes(lambda: "token", None, request=request)
+
+        with self.assertRaises(ValueError):
+            likes.tracks_page("likes")
+
+    def test_play_history_entries_load_like_liked_tracks_without_needing_the_user_id(self):
+        app = load_module()
+        entries = [{"played_at": 1, "track_id": n, "track": like_item(n)["track"]} for n in (1, 2, 3)]
+        api = FakeSoundCloudApi(history_items=entries)
+        likes = app.TrackLikes(lambda: "token", api.write, request=api)
+
+        first, cursor = likes.tracks_page("history")
+        second, last = likes.tracks_page("history", cursor)
+
+        self.assertEqual([t["playbackId"] for t in first], ["soundcloud:tracks:1", "soundcloud:tracks:2"])
+        self.assertEqual([t["playbackId"] for t in second], ["soundcloud:tracks:3"])
+        self.assertIsNone(last)
+        self.assertEqual(
+            [path for _method, path, _token in api.calls if "play-history" in path],
+            ["/me/play-history/tracks?limit=24", "/me/play-history/tracks?limit=2&offset=2"],
+        )
+
+    def test_history_never_follows_a_cursor_to_the_likes_path_or_off_soundcloud(self):
+        app = load_module()
+        for next_href in (
+            "https://api-v2.soundcloud.com/users/1/track_likes?offset=2",
+            "https://evil.example/me/play-history/tracks?offset=2",
+        ):
+            def request(method, path, token, maximum=0, next_href=next_href):
+                if path == "/me":
+                    return {"id": 1}
+                return {"collection": [like_item(3)], "next_href": next_href}
+
+            _tracks, cursor = app.TrackLikes(lambda: "token", None, request=request).tracks_page("history")
+
+            self.assertIsNone(cursor, next_href)
+
+    def test_account_list_commands_accept_only_known_sources(self):
+        app = load_module()
+
+        self.assertEqual(app.api_list_source_from_command("tracks:likes", "tracks:"), "likes")
+        self.assertEqual(app.api_list_source_from_command("tracks:history", "tracks:"), "history")
+        self.assertEqual(app.api_list_source_from_command("load-more:history", "load-more:"), "history")
+        self.assertIsNone(app.api_list_source_from_command("tracks:feed", "tracks:"))
+        self.assertIsNone(app.api_list_source_from_command("load-more:likes", "tracks:"))
+        self.assertIsNone(app.api_list_source_from_command("tracks:../me", "tracks:"))
+        self.assertIsNone(app.api_list_source_from_command("likes", "tracks:"))
+
+    def test_only_home_and_feed_pages_give_playback_a_request_context(self):
+        app = load_module()
+
+        self.assertTrue(app.is_track_source_page("https://soundcloud.com/discover"))
+        self.assertTrue(app.is_track_source_page("https://soundcloud.com/feed?x=1"))
+        self.assertFalse(app.is_track_source_page("https://soundcloud.com/you/likes"))
+        self.assertFalse(app.is_track_source_page("https://soundcloud.com/discovery"))
+        self.assertFalse(app.is_track_source_page("https://evil.example/https://soundcloud.com/feed"))
+        self.assertFalse(app.is_track_source_page(""))
+
+    def test_likes_survive_a_restart_through_the_track_cache(self):
+        app = load_module()
+        row = app.track_from_entry(like_item(4))
+
+        cache = app.sanitize_track_cache({"likes": [row], "history": [row], "home": []})
+
+        self.assertEqual(cache, {"likes": [row], "history": [row]})
 
 
 class TrackLikesTest(unittest.TestCase):
@@ -1952,10 +2173,33 @@ class BarWidgetTest(unittest.TestCase):
     def test_popup_uses_seekable_waveform_instead_of_feed_buttons(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
 
-        self.assertNotIn('text: "Likes"', qml)
         self.assertNotIn('text: "Following"', qml)
         self.assertIn("Canvas {", qml)
         self.assertIn('root.runAction("seek"', qml)
+
+    def test_likes_tab_sits_next_to_feed_and_reads_likes_without_navigating_the_page(self):
+        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+
+        self.assertLess(qml.index('text: "Feed"'), qml.index('text: "Likes"'))
+        self.assertIn('onClicked: root.selectTab("likes")', qml)
+        self.assertIn("if (!isAccountTab(tab)) runAction(tab)", qml)
+
+    def test_library_link_opens_the_soundcloud_library_in_the_browser_apart_from_the_tabs(self):
+        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+
+        self.assertLess(qml.index('text: "History"'), qml.index('text: "Library'))
+        self.assertIn(
+            'Quickshell.execDetached(["omarchy", "launch", "browser", "https://soundcloud.com/you/library"])',
+            qml,
+        )
+        self.assertNotIn("selectTab(\"library\")", qml)
+
+    def test_history_tab_follows_likes_and_reads_from_the_account_api(self):
+        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+
+        self.assertLess(qml.index('text: "Likes"'), qml.index('text: "History"'))
+        self.assertIn('onClicked: root.selectTab("history")', qml)
+        self.assertIn('tab === "likes" || tab === "history"', qml)
 
     def test_popup_has_larger_scrollable_home_and_feed_browser(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()

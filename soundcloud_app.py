@@ -45,6 +45,12 @@ MAX_TITLE_BYTES = 512
 MAX_ARTIST_BYTES = 256
 MAX_URL_BYTES = 2048
 MAX_TRACKS = 100
+API_LIST_REFRESH_SECONDS = 60.0
+# Track lists read straight from the account API, with each list's first-page path.
+API_TRACK_LISTS = {
+    "likes": "/users/{user_id}/track_likes",
+    "history": "/me/play-history/tracks",
+}
 MAX_PLAY_COUNT = 10**12
 MAX_TRACK_DURATION_MS = 7 * 24 * 60 * 60 * 1000
 MAX_ARTWORK_BYTES = 131072
@@ -606,6 +612,11 @@ def source_uri(source: str) -> str | None:
     }.get(source)
 
 
+def is_track_source_page(uri: str) -> bool:
+    """Whether the page is one whose API calls give playback its request context."""
+    return re.match(r"https://soundcloud\.com/(discover|feed)([/?#]|$)", uri) is not None
+
+
 def normalize_backend_command(command: str) -> str:
     return "show" if command == "launch" else command
 
@@ -615,6 +626,11 @@ def track_source_from_command(command: str) -> str | None:
         "tracks:home": "home",
         "tracks:feed": "feed",
     }.get(command)
+
+
+def api_list_source_from_command(command: str, prefix: str) -> str | None:
+    source = command.removeprefix(prefix) if command.startswith(prefix) else None
+    return source if source in API_TRACK_LISTS else None
 
 
 def load_more_source_from_command(command: str) -> str | None:
@@ -1492,7 +1508,7 @@ def sanitize_track_cache(payload: object) -> dict[str, list[dict[str, object]]]:
     if not isinstance(payload, dict):
         return {}
     sanitized = {}
-    for source in ("home", "feed"):
+    for source in ("home", "feed", *API_TRACK_LISTS):
         tracks = payload.get(source)
         if not isinstance(tracks, list) or not tracks:
             continue
@@ -2076,6 +2092,34 @@ def soundcloud_api_request(method: str, path: str, token: str, maximum: int = 25
     return json.loads(data) if data.strip() else None
 
 
+def track_from_entry(item: object) -> dict[str, object] | None:
+    """Turn one likes or play-history entry into a track row, or None if unusable."""
+    track = item.get("track") if isinstance(item, dict) else None
+    if not isinstance(track, dict):
+        return None
+    track_id, duration = track.get("id"), track.get("duration")
+    title, permalink = track.get("title"), track.get("permalink_url")
+    if (isinstance(track_id, bool) or not isinstance(track_id, int) or track_id <= 0
+            or isinstance(duration, bool) or not isinstance(duration, int)
+            or not isinstance(title, str) or not title.strip()
+            or not isinstance(permalink, str) or not permalink):
+        return None
+    user = track.get("user") if isinstance(track.get("user"), dict) else {}
+    publisher = track.get("publisher_metadata") if isinstance(track.get("publisher_metadata"), dict) else {}
+    artist = user.get("username") or user.get("full_name") or publisher.get("artist") or ""
+    art_url = track.get("artwork_url") or user.get("avatar_url") or ""
+    play_count = track.get("playback_count")
+    return {
+        "playbackId": f"soundcloud:tracks:{track_id}",
+        "title": title.strip()[:512],
+        "artist": str(artist)[:256],
+        "url": permalink[:2048],
+        "artUrl": str(art_url)[:2048],
+        "playCount": play_count if isinstance(play_count, int) and not isinstance(play_count, bool) else 0,
+        "durationMs": duration,
+    }
+
+
 class TrackLikes:
     """The signed-in account's liked tracks, read over the private API.
 
@@ -2085,6 +2129,7 @@ class TrackLikes:
 
     RETRY_SECONDS = 60.0
     MAX_LIKE_PAGES = 50
+    PAGE_SIZE = 24
 
     def __init__(self, load_token, write, request=soundcloud_api_request, spawn=None):
         self.load_token = load_token
@@ -2098,7 +2143,7 @@ class TrackLikes:
         self.loading = False
         self.last_attempt = -math.inf
 
-    def _session(self) -> str:
+    def _identify(self) -> str:
         token = self.load_token()
         if not token:
             raise PermissionError("not signed in")
@@ -2110,6 +2155,10 @@ class TrackLikes:
             if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
                 raise ValueError("invalid account response")
             self.user_id = user_id
+        return token
+
+    def _session(self) -> str:
+        token = self._identify()
         if self.liked_ids is None:
             liked_ids = set()
             path = "/me/track_likes/ids?limit=200"
@@ -2132,6 +2181,28 @@ class TrackLikes:
                 path = parsed.path + "?" + parsed.query
             self.liked_ids = liked_ids
         return token
+
+    def tracks_page(self, source: str, cursor: str | None = None) -> tuple[list[dict[str, object]], str | None]:
+        """One page of an `API_TRACK_LISTS` list, newest first, and the cursor for the next page.
+
+        `cursor` is only ever a value this method returned earlier.
+        """
+        with self.lock:
+            token = self._identify()
+            list_path = API_TRACK_LISTS[source].format(user_id=self.user_id)
+        payload = self.request(
+            "GET", cursor or f"{list_path}?limit={self.PAGE_SIZE}", token, 2 * 1024 * 1024
+        )
+        items = payload.get("collection") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            raise ValueError("invalid likes response")
+        tracks = [track for track in map(track_from_entry, items) if track is not None]
+        next_href = payload.get("next_href")
+        parsed = urlparse(next_href) if isinstance(next_href, str) else None
+        if (not items or parsed is None or parsed.scheme != "https"
+                or parsed.netloc != "api-v2.soundcloud.com" or parsed.path != list_path):
+            return tracks, None
+        return tracks, parsed.path + "?" + parsed.query
 
     def is_liked(self, track_id: int) -> bool | None:
         liked_ids = self.liked_ids
@@ -2758,6 +2829,10 @@ def build_application(show_on_start: bool = False):
                 for track in tracks
                 if is_playback_id(track.get("playbackId"))
             }
+            self.api_lists = {
+                source: {"cursor": None, "loading": False, "loaded_at": -math.inf}
+                for source in API_TRACK_LISTS
+            }
             self.selection_generation = 0
             self.track_cache_save_pending = False
             self.had_subscriber = False
@@ -2987,6 +3062,65 @@ def build_application(show_on_start: bool = False):
                 pass
             return False
 
+        def _load_api_list(self, source, reset):
+            """Fetch one page of an account list on a worker thread; False if one is already loading."""
+            state = self.api_lists[source]
+            if state["loading"]:
+                return False
+            state["loading"] = True
+            cursor = None if reset else state["cursor"]
+
+            def worker():
+                tracks, next_cursor, error = [], None, ""
+                try:
+                    tracks, next_cursor = self.track_likes.tracks_page(source, cursor)
+                except PermissionError:
+                    error = f"Sign in to SoundCloud to see your {source}"
+                except (OSError, ValueError):
+                    error = f"Could not load your {source}"
+                GLib.idle_add(self._api_list_loaded, source, reset, tracks, next_cursor, error)
+
+            threading.Thread(target=worker, daemon=True).start()
+            return True
+
+        def _api_list_loaded(self, source, reset, tracks, next_cursor, error):
+            state = self.api_lists[source]
+            state["loading"] = False
+            existing = self.track_cache.get(source, [])
+            if error:
+                reset, merged, added_count = False, existing, 0
+            else:
+                merged = merge_track_pages(existing, tracks, reset=reset)
+                added_count = max(0, len(merged) - (0 if reset else len(existing)))
+                state["cursor"] = (
+                    next_cursor if len(merged) < MAX_TRACKS and (reset or added_count > 0) else None
+                )
+                state["loaded_at"] = time.monotonic()
+            result = self._secure_tracks({"tracks": merged})
+            if result is None:
+                return False
+            for track in merged:
+                self.playback_tracks[track["playbackId"]] = track
+            while len(self.playback_tracks) > MAX_TRACKS * 2:
+                self.playback_tracks.pop(next(iter(self.playback_tracks)))
+            self.status_subscribers.publish_message(
+                {
+                    "type": "tracks",
+                    "source": source,
+                    "reset": reset,
+                    "hasMore": state["cursor"] is not None,
+                    "addedCount": added_count,
+                    **({"error": error} if error else {}),
+                    **result,
+                }
+            )
+            if not error and merged:
+                self.track_cache[source] = merged
+                if not self.track_cache_save_pending:
+                    self.track_cache_save_pending = True
+                    GLib.idle_add(self._save_track_cache)
+            return False
+
         def _publish_cached_tracks(self, source):
             cached = self.track_cache.get(source)
             if not cached:
@@ -3195,6 +3329,37 @@ def build_application(show_on_start: bool = False):
                 self.disconnect_generation += 1
                 self._respond(connection, request_id, {"ok": True, "running": True})
                 GLib.idle_add(self._publish_status_once)
+            elif (source := api_list_source_from_command(command, "tracks:")) is not None:
+                # These lists are fetched here, but playing one needs the request context the
+                # page only records on Home and Feed, so keep the page on one of them.
+                if self.webview and not is_track_source_page(self.webview.get_uri() or ""):
+                    self.webview.load_uri(source_uri("home"))
+                cached = self._secure_tracks({"tracks": self.track_cache.get(source, [])})
+                if time.monotonic() - self.api_lists[source]["loaded_at"] > API_LIST_REFRESH_SECONDS:
+                    self._load_api_list(source, reset=True)
+                self._respond(
+                    connection,
+                    request_id,
+                    {
+                        "ok": cached is not None,
+                        "running": True,
+                        **(cached or {"tracks": [], "error": "invalid track data"}),
+                        **({"pending": True} if cached is not None and not cached["tracks"] else {}),
+                    },
+                )
+            elif (source := api_list_source_from_command(command, "load-more:")) is not None:
+                has_cursor = self.api_lists[source]["cursor"] is not None
+                started = has_cursor and self._load_api_list(source, reset=False)
+                self._respond(
+                    connection,
+                    request_id,
+                    {
+                        "ok": True,
+                        "running": True,
+                        "started": started,
+                        "hasMore": self.api_lists[source]["cursor"] is not None,
+                    },
+                )
             elif (source := load_more_source_from_command(command)) is not None:
                 def load_more_finished(payload):
                     valid = isinstance(payload, dict)
@@ -3387,6 +3552,7 @@ def build_application(show_on_start: bool = False):
                 def update_like():
                     try:
                         self.track_likes.set_liked(int(playback_id.rpartition(":")[2]), liked)
+                        self.api_lists["likes"]["loaded_at"] = -math.inf  # refresh the Likes tab on next view
                         payload = {"ok": True, "running": True, "playbackId": playback_id, "liked": liked}
                     except BotCheckRequired:
                         GLib.idle_add(self.show_login)
