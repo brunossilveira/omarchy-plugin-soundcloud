@@ -467,6 +467,7 @@ BarWidget {
   }
 
   onBackendConnectedChanged: initializeConnection()
+  Component.onCompleted: desktopEntryProcess.running = true
 
   visible: true
   implicitWidth: row.implicitWidth + Style.space(14)
@@ -1060,6 +1061,12 @@ BarWidget {
       socketLoader.active = false
       socketLoader.active = true
     }
+  }
+
+  Process {
+    id: desktopEntryProcess
+    running: false
+    command: ["/usr/bin/python3", "-I", helperPath, "install-desktop-entry"]
   }
 
   Process {

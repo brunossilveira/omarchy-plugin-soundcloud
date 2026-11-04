@@ -46,8 +46,10 @@ python3 soundcloud_app.py check
 omarchy plugin add https://github.com/brunossilveira/omarchy-plugin-soundcloud.git --enable
 ```
 
-The widget appears in the right section of the top bar. Open or close its popup
-from a keybinding or script with:
+The widget appears in the right section of the top bar. Once the plugin loads,
+SoundCloud also appears in the Omarchy application menu's Apps list and search;
+selecting it starts the backend and opens the SoundCloud window. Open or close
+the bar popup from a keybinding or script with:
 
 ```sh
 omarchy-shell shell toggle brunosilveira.soundcloud

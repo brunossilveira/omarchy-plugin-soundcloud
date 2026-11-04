@@ -98,6 +98,57 @@ def profile_paths(env: Mapping[str, str] | None = None) -> ProfilePaths:
     )
 
 
+def desktop_entry_path(env: Mapping[str, str] | None = None) -> Path:
+    """Return this plugin's application-menu entry path."""
+    values: Mapping[str, str] = os.environ if env is None else env
+    trusted_home = pwd.getpwuid(os.geteuid()).pw_dir if env is None else values.get("HOME", str(Path.home()))
+    data_home = Path(values.get("XDG_DATA_HOME", Path(trusted_home) / ".local" / "share"))
+    if not data_home.is_absolute():
+        data_home = Path(trusted_home) / ".local" / "share"
+    return data_home / "applications" / f"{APP_ID}.desktop"
+
+
+def desktop_entry_argument(value: str) -> str:
+    """Quote a desktop-entry Exec argument only when its path requires it."""
+    if not re.search(r'[\s"\\]', value):
+        return value
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def install_desktop_entry(env: Mapping[str, str] | None = None) -> Path:
+    """Install an application-menu launcher for the current plugin checkout."""
+    path = desktop_entry_path(env)
+    helper_path = desktop_entry_argument(str(Path(__file__).resolve()))
+    contents = (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        f"Name={APP_NAME}\n"
+        "Comment=SoundCloud playback and browsing in Omarchy\n"
+        f"Exec=/usr/bin/python3 -I {helper_path} launch\n"
+        "Icon=audio-x-generic\n"
+        "Terminal=false\n"
+        "Categories=AudioVideo;Audio;Player;\n"
+        "Keywords=SoundCloud;Music;Audio;\n"
+        "StartupNotify=false\n"
+    )
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o644)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return path
+
+
 def runtime_socket_path(env: Mapping[str, str] | None = None) -> Path:
     values = os.environ if env is None else env
     runtime_dir = values.get("XDG_RUNTIME_DIR")
@@ -3557,6 +3608,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     seek.add_argument("ratio", type=float)
     play = subparsers.add_parser("play")
     play.add_argument("playback_id")
+    subparsers.add_parser("install-desktop-entry")
     subparsers.add_parser("launch")
     subparsers.add_parser("ensure")
     for action in ("status", "play-pause", "next", "previous", "home", "likes", "feed", "show", "stop"):
@@ -3572,6 +3624,9 @@ def main(argv: list[str] | None = None) -> int:
         result = dependency_check()
         print(json.dumps(result, sort_keys=True))
         return 0 if result["ok"] else 1
+    if command == "install-desktop-entry":
+        print(install_desktop_entry())
+        return 0
     if command in {"launch", "ensure"}:
         result = launch_backend(show=command == "launch")
         print(json.dumps(result, sort_keys=True))

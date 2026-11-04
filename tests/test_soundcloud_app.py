@@ -1824,6 +1824,42 @@ class CheckResultTest(unittest.TestCase):
 class LaunchBackendTest(unittest.TestCase):
     missing = {"ok": False, "error": "Missing gst-libav. Run: omarchy pkg add gst-libav"}
 
+    def test_installs_a_desktop_entry_that_launches_this_plugin(self):
+        app = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(
+                app.desktop_entry_path({"HOME": directory, "XDG_DATA_HOME": "/custom/data"}),
+                Path("/custom/data/applications/com.github.brunosilveira.OmarchySoundCloud.desktop"),
+            )
+            path = app.install_desktop_entry({"HOME": directory})
+
+            self.assertEqual(
+                path,
+                Path(directory) / ".local/share/applications/com.github.brunosilveira.OmarchySoundCloud.desktop",
+            )
+            self.assertEqual(
+                path.read_text(),
+                "[Desktop Entry]\n"
+                "Type=Application\n"
+                "Name=SoundCloud\n"
+                "Comment=SoundCloud playback and browsing in Omarchy\n"
+                f"Exec=/usr/bin/python3 -I {MODULE_PATH.resolve()} launch\n"
+                "Icon=audio-x-generic\n"
+                "Terminal=false\n"
+                "Categories=AudioVideo;Audio;Player;\n"
+                "Keywords=SoundCloud;Music;Audio;\n"
+                "StartupNotify=false\n",
+            )
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+
+    def test_bar_widget_registers_the_application_menu_launcher_without_starting_playback(self):
+        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+
+        self.assertIn('"install-desktop-entry"', qml)
+        self.assertIn("id: desktopEntryProcess", qml)
+        self.assertIn("Component.onCompleted: desktopEntryProcess.running = true", qml)
+        self.assertNotIn("Component.onCompleted: startBackend", qml)
+
     def test_missing_dependencies_are_reported_instead_of_starting_a_doomed_backend(self):
         app = load_module()
         with mock.patch.object(app, "request_backend", return_value=None), \
