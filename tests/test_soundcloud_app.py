@@ -2508,3 +2508,11 @@ eval({json.dumps(app.api_request_capture_script())});
         self.assertIn('sendCommand("shuffle:" + listSource(), "action")', source)
         self.assertIn("onClicked: root.shuffleCurrentList()", source)
         self.assertIn('openedCollection.tab', source)
+
+    def test_opened_collection_reply_is_matched_by_collection_id(self):
+        # Replies carry the request number in "id", so the collection travels as collectionId.
+        source = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        backend = MODULE_PATH.read_text()
+        self.assertIn("Number(message.collectionId) !== openedCollection.id", source)
+        self.assertNotIn("Number(message.id) !== openedCollection.id", source)
+        self.assertIn('{"kind": kind, "collectionId": identifier}', backend)

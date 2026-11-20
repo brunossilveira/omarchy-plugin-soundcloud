@@ -4347,7 +4347,7 @@ def build_application(show_on_start: bool = False):
                 self._page_list(
                     OPEN_COLLECTION_FUNCTION,
                     {"kind": GLib.Variant("s", kind), "id": GLib.Variant("d", float(identifier))},
-                    "collection", connection, request_id, {"kind": kind, "id": identifier},
+                    "collection", connection, request_id, {"kind": kind, "collectionId": identifier},
                 )
             elif command == "likes":
                 self._page_list(LIKED_TRACKS_FUNCTION, {}, "likes", connection, request_id, {})

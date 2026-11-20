@@ -295,7 +295,7 @@ BarWidget {
   }
 
   function applyCollectionResult(message) {
-    if (!openedCollection || Number(message.id) !== openedCollection.id
+    if (!openedCollection || Number(message.collectionId) !== openedCollection.id
         || String(message.kind || "") !== openedCollection.kind) return
     collectionPending = false
     collectionTracks = Array.isArray(message.tracks) ? message.tracks.slice(0, 100) : []
