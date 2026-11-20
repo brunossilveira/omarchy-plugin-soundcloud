@@ -37,6 +37,9 @@ BarWidget {
   property bool likesPending: false
   property bool likesLoaded: false
   property var openedCollection: null
+  property var mixesRows: []
+  property bool mixesPending: false
+  property bool mixesLoaded: false
   property var collectionTracks: []
   property bool collectionPending: false
   property real volume: 1
@@ -118,8 +121,23 @@ BarWidget {
 
   // The list a played track belongs to; the backend queues it for next/previous.
   function listSource() {
-    if (selectedTab === "search") return openedCollection ? "collection" : "search"
+    if (collectionOpenIn(selectedTab)) return "collection"
     return selectedTab
+  }
+
+  // Search and Mixes each drill into a playlist, artist, or mix.
+  function collectionOpenIn(tab) { return !!openedCollection && openedCollection.tab === tab }
+
+  // Track lists (not playlist/artist/mix rows) can be shuffled.
+  readonly property bool canShuffle: tracks.length > 1 && !tracks[0].collection
+    && (isPageTab(selectedTab) || selectedTab === "likes" || collectionOpenIn(selectedTab)
+      || (selectedTab === "search" && searchKind === "tracks"))
+
+  function shuffleCurrentList() {
+    if (!canShuffle || !backendConnected) return
+    lastError = ""
+    actionBusy = true
+    if (sendCommand("shuffle:" + listSource(), "action") === 0) actionBusy = false
   }
 
   function refreshTracks() {
@@ -133,9 +151,16 @@ BarWidget {
   function selectTab(tab) {
     if (tab === "search") {
       selectedTab = tab
-      tracks = openedCollection ? collectionTracks : searchTracks
-      tracksLoading = openedCollection ? collectionPending : searchPending
-      if (!openedCollection) focusSearchField()
+      tracks = collectionOpenIn("search") ? collectionTracks : searchTracks
+      tracksLoading = collectionOpenIn("search") ? collectionPending : searchPending
+      if (!collectionOpenIn("search")) focusSearchField()
+      return
+    }
+    if (tab === "mixes") {
+      selectedTab = tab
+      tracks = collectionOpenIn("mixes") ? collectionTracks : mixesRows
+      tracksLoading = collectionOpenIn("mixes") ? collectionPending : (mixesPending || !mixesLoaded)
+      if (!mixesLoaded && !mixesPending) loadMixes()
       return
     }
     if (tab === "likes") {
@@ -166,7 +191,7 @@ BarWidget {
     if (query === "" || !backendConnected || !running || !loggedIn) return
     searchQuery = query
     searchPending = true
-    openedCollection = null
+    if (collectionOpenIn("search")) openedCollection = null
     lastError = ""
     if (selectedTab === "search") {
       tracks = []
@@ -194,30 +219,58 @@ BarWidget {
     if (kind === "tracks") {
       searchTracks = Array.isArray(message.tracks) ? message.tracks.slice(0, 100) : []
     } else {
-      // Playlists and artists open into their tracks when clicked.
-      var rows = []
-      var collections = Array.isArray(message.collections) ? message.collections : []
-      for (var index = 0; index < collections.length && index < 50; index++) {
-        var item = collections[index]
-        rows.push({
-          collection: true, kind: String(item.kind || ""), id: Number(item.id) || 0,
-          title: String(item.title || ""), artist: String(item.subtitle || ""),
-          artworkId: String(item.artworkId || "")
-        })
-      }
-      searchTracks = rows
+      searchTracks = collectionRows(message.collections)
     }
     if (message.ok !== true) lastError = String(message.error || "SoundCloud search failed")
-    if (selectedTab === "search" && !openedCollection) {
+    if (selectedTab === "search" && !collectionOpenIn("search")) {
       tracks = searchTracks
       tracksLoading = false
       trackList.contentY = trackList.originY
     }
   }
 
+  // Playlists, artists, and mixes open into their tracks when clicked.
+  function collectionRows(collections) {
+    var rows = []
+    var items = Array.isArray(collections) ? collections : []
+    for (var index = 0; index < items.length && index < 50; index++) {
+      var item = items[index]
+      rows.push({
+        collection: true, kind: String(item.kind || ""), id: Number(item.id) || 0,
+        title: String(item.title || ""), artist: String(item.subtitle || ""),
+        artworkId: String(item.artworkId || "")
+      })
+    }
+    return rows
+  }
+
+  function loadMixes() {
+    if (mixesPending || !backendConnected || !running || !loggedIn) return
+    mixesPending = true
+    if (selectedTab === "mixes" && !collectionOpenIn("mixes")) tracksLoading = true
+    if (sendCommand("mixes", "mixes") === 0) {
+      mixesPending = false
+      if (selectedTab === "mixes") tracksLoading = false
+    }
+  }
+
+  function applyMixesResult(message) {
+    mixesPending = false
+    if (message.ok === true) {
+      mixesLoaded = true
+      mixesRows = collectionRows(message.collections)
+    } else {
+      lastError = String(message.error || "SoundCloud could not load your mixes")
+    }
+    if (selectedTab === "mixes" && !collectionOpenIn("mixes")) {
+      tracks = mixesRows
+      tracksLoading = false
+    }
+  }
+
   function openCollection(row) {
     if (!row || !row.collection || !(row.id > 0)) return
-    openedCollection = { kind: row.kind, id: row.id, title: row.title }
+    openedCollection = { kind: row.kind, id: row.id, title: row.title, tab: selectedTab }
     collectionTracks = []
     collectionPending = true
     lastError = ""
@@ -235,15 +288,19 @@ BarWidget {
     if (selectedTab === "search") {
       tracks = searchTracks
       tracksLoading = searchPending
+    } else if (selectedTab === "mixes") {
+      tracks = mixesRows
+      tracksLoading = mixesPending
     }
   }
 
   function applyCollectionResult(message) {
-    if (!openedCollection || Number(message.id) !== openedCollection.id) return
+    if (!openedCollection || Number(message.id) !== openedCollection.id
+        || String(message.kind || "") !== openedCollection.kind) return
     collectionPending = false
     collectionTracks = Array.isArray(message.tracks) ? message.tracks.slice(0, 100) : []
     if (message.ok !== true) lastError = String(message.error || "SoundCloud could not open this")
-    if (selectedTab === "search") {
+    if (selectedTab === openedCollection.tab) {
       tracks = collectionTracks
       tracksLoading = false
       trackList.contentY = trackList.originY
@@ -283,9 +340,11 @@ BarWidget {
       trackReloadTimer.restart()
     } else if (selectedTab === "likes") {
       loadLikes()
-    } else if (openedCollection) {
+    } else if (collectionOpenIn(selectedTab)) {
       openCollection({ collection: true, kind: openedCollection.kind,
         id: openedCollection.id, title: openedCollection.title })
+    } else if (selectedTab === "mixes") {
+      loadMixes()
     } else if (searchQuery !== "") {
       runSearch(searchQuery)
     }
@@ -432,6 +491,7 @@ BarWidget {
     feedLoadMorePending = false
     searchPending = false
     likesPending = false
+    mixesPending = false
     collectionPending = false
     trackArtworkPending = ({})
     tracksLoading = false
@@ -617,6 +677,8 @@ BarWidget {
       applySearchResult(message)
     } else if (kind === "likes") {
       applyLikesResult(message)
+    } else if (kind === "mixes") {
+      applyMixesResult(message)
     } else if (kind === "collection") {
       applyCollectionResult(message)
     } else if (kind === "like") {
@@ -880,7 +942,7 @@ BarWidget {
     bar: root.bar
     owner: root
     open: root.popupOpen
-    contentWidth: popup.fittedContentWidth(Style.space(408))
+    contentWidth: popup.fittedContentWidth(Style.space(440))
     contentHeight: popup.fittedContentHeight(Style.space(560))
 
     Column {
@@ -1155,7 +1217,7 @@ BarWidget {
       }
 
       Row {
-        spacing: Style.space(8)
+        spacing: Style.space(4)
         visible: root.running && root.loggedIn
 
         Button {
@@ -1182,6 +1244,13 @@ BarWidget {
         }
 
         Button {
+          text: "Mixes"
+          foreground: root.bar.foreground
+          selected: root.selectedTab === "mixes"
+          onClicked: root.selectTab("mixes")
+        }
+
+        Button {
           text: "Search"
           foreground: root.bar.foreground
           selected: root.selectedTab === "search"
@@ -1193,6 +1262,14 @@ BarWidget {
           foreground: root.bar.foreground
           enabled: !root.actionBusy
           onClicked: root.refreshCurrentList()
+        }
+
+        Button {
+          iconText: "󰒝"
+          foreground: root.bar.foreground
+          enabled: root.canShuffle && !root.actionBusy
+          opacity: enabled ? 1 : 0.4
+          onClicked: root.shuffleCurrentList()
         }
       }
 
@@ -1214,7 +1291,7 @@ BarWidget {
 
       Row {
         spacing: Style.space(6)
-        visible: searchField.visible && !root.openedCollection
+        visible: searchField.visible && !root.collectionOpenIn("search")
 
         Repeater {
           model: [["tracks", "Tracks"], ["playlists", "Playlists"], ["users", "Artists"]]
@@ -1231,7 +1308,7 @@ BarWidget {
       Row {
         width: parent.width
         spacing: Style.space(8)
-        visible: root.running && root.loggedIn && root.selectedTab === "search" && !!root.openedCollection
+        visible: root.running && root.loggedIn && root.collectionOpenIn(root.selectedTab)
 
         Button {
           id: collectionBack
@@ -1421,8 +1498,9 @@ BarWidget {
           anchors.centerIn: parent
           visible: root.tracksLoading && root.tracks.length === 0
           textFormat: Text.PlainText
-          text: root.selectedTab === "search" ? (root.openedCollection ? "Loading tracks…" : "Searching…")
-            : "Loading " + ({ home: "Home", feed: "Feed", likes: "Likes" })[root.selectedTab] + "…"
+          text: root.collectionOpenIn(root.selectedTab) ? "Loading tracks…"
+            : (root.selectedTab === "search" ? "Searching…"
+            : "Loading " + ({ home: "Home", feed: "Feed", likes: "Likes", mixes: "your mixes" })[root.selectedTab] + "…")
           color: root.dim
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.body
@@ -1437,8 +1515,9 @@ BarWidget {
             anchors.horizontalCenter: parent.horizontalCenter
             textFormat: Text.PlainText
             text: root.selectedTab === "likes" ? "No liked tracks yet"
-              : (root.selectedTab !== "search" || root.openedCollection ? "No tracks found"
-              : (root.searchQuery === "" ? "Type a search and press Enter" : "No results for “" + root.searchQuery + "”"))
+              : (root.selectedTab === "mixes" && !root.collectionOpenIn("mixes") ? "No mixes yet"
+              : (root.selectedTab !== "search" || root.collectionOpenIn("search") ? "No tracks found"
+              : (root.searchQuery === "" ? "Type a search and press Enter" : "No results for “" + root.searchQuery + "”")))
             color: root.dim
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.body

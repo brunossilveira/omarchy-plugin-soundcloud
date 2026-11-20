@@ -1027,10 +1027,21 @@ def api_request_capture_script() -> str:
           error: String(error || 'Could not load more tracks').slice(0, 128)
         }));
       };
+      // Home's selections (your mixes, stations, playlists) for the Mixes tab.
+      let homeSelections = [];
+      const rememberSelections = (payload) => {
+        const list = payload && Array.isArray(payload.collection) ? payload.collection.slice(0, 50) : [];
+        const known = new Set(homeSelections.map((selection) => selection && selection.urn));
+        homeSelections = homeSelections
+          .concat(list.filter((selection) => selection && typeof selection === 'object' && !known.has(selection.urn)))
+          .slice(0, 50);
+      };
+      window.__omarchyHomeSelections = () => homeSelections;
       const publish = async (path, text, context, routeGeneration) => {
         try {
           if (!(text.length > 0 && text.length <= 2 * 1024 * 1024)) throw new Error('invalid response');
           const payload = JSON.parse(text);
+          if (path === '/mixed-selections') rememberSelections(payload);
           const stagedPlayback = new Map();
           const tracks = path === '/mixed-selections'
             ? await homeTracks(payload, context, stagedPlayback)
@@ -1484,10 +1495,10 @@ def api_request_capture_script() -> str:
         return tracks.slice(0, 50);
       };
       // Follow SoundCloud's next_href (same api-v2 path only) until 50 tracks.
-      const pagedTracks = async (pathname, params) => {
+      const pagedTracks = async (pathname, params, limit = 50) => {
         let { payload, context } = await apiGet(pathname, params);
         let tracks = normaliseEach(payload, context);
-        for (let page = 1; page < 4 && tracks.length < 50; page++) {
+        for (let page = 1; page < 8 && tracks.length < limit; page++) {
           const next = validNextUrl(payload, pathname);
           if (!next) break;
           const url = new URL(next);
@@ -1497,7 +1508,70 @@ def api_request_capture_script() -> str:
           const known = new Set(tracks.map((track) => track.url));
           tracks = tracks.concat(normaliseEach(payload, context).filter((track) => !known.has(track.url)));
         }
-        return tracks.slice(0, 50);
+        return tracks.slice(0, limit);
+      };
+      // Track stubs ({id}) to full tracks, kept in the given order.
+      const tracksForIds = async (ids, known = []) => {
+        let tracks = known;
+        const have = new Set(tracks.map((track) => track.playbackId));
+        const missing = ids.filter((trackId) => !have.has('soundcloud:tracks:' + trackId));
+        for (let index = 0; index < missing.length && index < 100; index += 50) {
+          const page = await apiGet('/tracks', { ids: missing.slice(index, index + 50).join(',') });
+          tracks = tracks.concat(normaliseEach(page.payload, page.context));
+        }
+        return tracksInOrder(ids, tracks).slice(0, 100);
+      };
+      // Mixes come from Home's selections; a mix is opened by its row number.
+      const mixTrackIds = new Map();
+      const selectionRank = (selection) => {
+        const urn = String(selection && selection.urn || '');
+        const order = ['your-moods', 'personalized-tracks', 'artist-stations', 'recently-played'];
+        const rank = order.findIndex((name) => urn.includes(':' + name));
+        return rank < 0 ? order.length : rank;
+      };
+      window.__omarchyMixes = async function() {
+        if (!homeSelections.length) return JSON.stringify({ collections: [], needsHome: true });
+        mixTrackIds.clear();
+        const collections = [];
+        const seen = new Set();
+        const selections = homeSelections.slice().sort((a, b) => selectionRank(a) - selectionRank(b));
+        for (const selection of selections) {
+          const itemState = selection.items && typeof selection.items === 'object' ? selection.items : null;
+          const items = Array.isArray(itemState) ? itemState
+            : (itemState && Array.isArray(itemState.collection) ? itemState.collection : []);
+          const group = String(selection.title || '').slice(0, 128);
+          for (const item of items.slice(0, 30)) {
+            if (!item || typeof item !== 'object' || collections.length >= 50) continue;
+            const key = String(item.urn || item.id || '');
+            if (!key || seen.has(key)) continue;
+            const user = item.user && typeof item.user === 'object' ? item.user : {};
+            const art = String(item.calculated_artwork_url || item.artwork_url || user.avatar_url || '').slice(0, 2048);
+            const link = typeof item.permalink_url === 'string' && /^https:\/\/soundcloud\.com\//.test(item.permalink_url)
+              ? item.permalink_url.slice(0, 2048) : 'https://soundcloud.com/discover';
+            if (item.kind === 'system-playlist' && Array.isArray(item.tracks)) {
+              const ids = item.tracks.slice(0, 100).map((entry) => positiveId(entry && entry.id)).filter(Boolean);
+              if (!ids.length) continue;
+              seen.add(key);
+              mixTrackIds.set(collections.length + 1, ids);
+              collections.push({
+                kind: 'mix', id: collections.length + 1,
+                title: String(item.title || item.short_title || 'Mix').slice(0, 512),
+                subtitle: [group, ids.length + ' tracks'].filter(Boolean).join('  •  ').slice(0, 256),
+                artUrl: art, url: link
+              });
+            } else if (item.kind === 'playlist' && positiveId(item.id)) {
+              seen.add(key);
+              const count = positiveId(item.track_count);
+              collections.push({
+                kind: 'playlist', id: item.id,
+                title: String(item.title || '').slice(0, 512) || 'Playlist',
+                subtitle: [group, count ? count + ' tracks' : ''].filter(Boolean).join('  •  ').slice(0, 256),
+                artUrl: art, url: link
+              });
+            }
+          }
+        }
+        return JSON.stringify({ collections });
       };
       const positiveId = (value) => Number.isSafeInteger(value) && value > 0 ? value : 0;
       const tracksInOrder = (ids, tracks) => {
@@ -1549,23 +1623,22 @@ def api_request_capture_script() -> str:
       };
       window.__omarchyOpenCollection = async function(kind, value) {
         const id = positiveId(Number(value));
-        if (!id || !['playlist', 'user'].includes(kind))
+        if (!id || !['playlist', 'user', 'mix'].includes(kind))
           return JSON.stringify({ tracks: [], error: 'SoundCloud could not open this' });
         try {
+          if (kind === 'mix') {
+            const ids = mixTrackIds.get(id);
+            if (!ids) throw new Error('SoundCloud mixes changed, open Mixes again');
+            return JSON.stringify({ tracks: await tracksForIds(ids) });
+          }
           if (kind === 'user') {
             return JSON.stringify({ tracks: await pagedTracks('/users/' + id + '/tracks', { limit: 50 }) });
           }
           const { payload, context } = await apiGet('/playlists/' + id, {});
           const entries = payload && Array.isArray(payload.tracks) ? payload.tracks.slice(0, 100) : [];
           const ids = entries.map((entry) => positiveId(entry && entry.id)).filter(Boolean);
-          let tracks = normaliseEach({ collection: entries.filter((entry) => entry && entry.title) }, context);
-          const known = new Set(tracks.map((track) => track.playbackId));
-          const missing = ids.filter((trackId) => !known.has('soundcloud:tracks:' + trackId));
-          for (let index = 0; index < missing.length && index < 100; index += 50) {
-            const page = await apiGet('/tracks', { ids: missing.slice(index, index + 50).join(',') });
-            tracks = tracks.concat(normaliseEach(page.payload, page.context));
-          }
-          return JSON.stringify({ tracks: tracksInOrder(ids, tracks).slice(0, 100) });
+          const embedded = normaliseEach({ collection: entries.filter((entry) => entry && entry.title) }, context);
+          return JSON.stringify({ tracks: await tracksForIds(ids, embedded) });
         } catch (error) {
           return JSON.stringify({ tracks: [], error: failure(error) });
         }
@@ -1575,7 +1648,7 @@ def api_request_capture_script() -> str:
           const me = await apiGet('/me', {});
           const userId = positiveId(me.payload && me.payload.id);
           if (!userId) throw new Error('SoundCloud did not return your account');
-          return JSON.stringify({ tracks: await pagedTracks('/users/' + userId + '/track_likes', { limit: 50 }) });
+          return JSON.stringify({ tracks: await pagedTracks('/users/' + userId + '/track_likes', { limit: 50 }, 100) });
         } catch (error) {
           return JSON.stringify({ tracks: [], error: failure(error) });
         }
@@ -2165,6 +2238,10 @@ OPEN_COLLECTION_FUNCTION = f"""
 if (typeof window.__omarchyOpenCollection !== 'function') {PAGE_FUNCTION_MISSING}
 return await window.__omarchyOpenCollection(kind, id);
 """
+MIXES_FUNCTION = f"""
+if (typeof window.__omarchyMixes !== 'function') {PAGE_FUNCTION_MISSING}
+return await window.__omarchyMixes();
+"""
 LIKED_TRACKS_FUNCTION = f"""
 if (typeof window.__omarchyLikes !== 'function') {PAGE_FUNCTION_MISSING}
 return await window.__omarchyLikes();
@@ -2195,8 +2272,23 @@ def search_query_from_command(command: str) -> str | None:
 
 
 def collection_from_command(command: str) -> tuple[str, int] | None:
-    match = re.fullmatch(r"open:(playlist|user):([1-9][0-9]{0,15})", command)
+    match = re.fullmatch(r"open:(playlist|user|mix):([1-9][0-9]{0,15})", command)
     return (match.group(1), int(match.group(2))) if match else None
+
+
+def shuffle_from_command(command: str) -> str | None:
+    """shuffle:<source> plays that list in a random order."""
+    source = command.removeprefix("shuffle:") if command.startswith("shuffle:") else ""
+    return source if source in QUEUE_SOURCES else None
+
+
+def shuffled_tracks(tracks: list[dict[str, object]], current: str = "") -> list[dict[str, object]]:
+    """Playable tracks in random order, never starting on the current track."""
+    playable = [track for track in tracks if is_playback_id(track.get("playbackId"))][:MAX_QUEUE]
+    secrets.SystemRandom().shuffle(playable)
+    if len(playable) > 1 and playable[0].get("playbackId") == current:
+        playable.append(playable.pop(0))
+    return playable
 
 
 def queued_play_from_command(command: str) -> tuple[str, str] | None:
@@ -2242,7 +2334,7 @@ def validate_collections_payload(payload: object) -> list[dict[str, object]] | N
         subtitle = _bounded_string(item.get("subtitle", ""), MAX_ARTIST_BYTES)
         url = _bounded_string(item.get("url", ""), MAX_URL_BYTES)
         art_url = _bounded_string(item.get("artUrl", ""), MAX_URL_BYTES)
-        if (kind not in {"playlist", "user"} or isinstance(identifier, bool)
+        if (kind not in {"playlist", "user", "mix"} or isinstance(identifier, bool)
                 or not isinstance(identifier, int) or not 0 < identifier < 10**16
                 or None in (title, subtitle, url, art_url) or not title
                 or not is_soundcloud_uri(url)):
@@ -4259,6 +4351,26 @@ def build_application(show_on_start: bool = False):
                 )
             elif command == "likes":
                 self._page_list(LIKED_TRACKS_FUNCTION, {}, "likes", connection, request_id, {})
+            elif command == "mixes":
+                self._load_mixes(connection, request_id, 0)
+            elif (shuffle_source := shuffle_from_command(command)) is not None:
+                current = self.queue[self.queue_index].get("playbackId", "") if 0 <= self.queue_index < len(self.queue) else ""
+                tracks = shuffled_tracks(self._list_tracks(shuffle_source), current)
+                if not tracks:
+                    self._respond(connection, request_id, {"ok": False, "error": "Nothing to shuffle yet"})
+                else:
+                    self.queue, self.queue_index, self.queue_source = tracks, 0, shuffle_source
+                    for track in tracks:
+                        self.playback_tracks.setdefault(track["playbackId"], track)
+
+                    def shuffle_started(ok, error):
+                        self._respond(
+                            connection, request_id,
+                            {"ok": ok, "running": True, "shuffled": len(tracks), **({"error": error} if error else {})},
+                            publish_status=ok or error != "selection superseded",
+                        )
+
+                    self._start_track(tracks[0]["playbackId"], shuffle_started)
             elif (volume := volume_from_command(command)) is not None:
                 self.playback.set_volume(volume)
                 self._evaluate(volume_script(volume), lambda _payload: None)
@@ -4369,7 +4481,29 @@ def build_application(show_on_start: bool = False):
                     item["artworkId"] = token
             return collections
 
-        def _page_list(self, function, arguments, list_name, connection, request_id, echo):
+        def _load_mixes(self, connection, request_id, attempt):
+            """Mixes come from Home's selections; load Home first when the page has none."""
+            def needs_home():
+                if attempt == 0:
+                    if self.page_media_present or self.page_playing:
+                        self._respond(connection, request_id, {
+                            "ok": False, "running": True, "tracks": [], "collections": [],
+                            "error": "Open Home once to load your mixes",
+                        })
+                        return
+                    self.cached_sources.discard("home")
+                    self.webview.load_uri(source_uri("home"))
+                if attempt >= 15:
+                    self._respond(connection, request_id, {
+                        "ok": False, "running": True, "tracks": [], "collections": [],
+                        "error": "SoundCloud mixes did not load",
+                    })
+                    return
+                GLib.timeout_add(1000, lambda: self._load_mixes(connection, request_id, attempt + 1) and False)
+
+            self._page_list(MIXES_FUNCTION, {}, "", connection, request_id, {}, needs_home)
+
+        def _page_list(self, function, arguments, list_name, connection, request_id, echo, needs_home=None):
             """Run a page list function (search, likes, playlist, artist) and answer with its rows."""
             def respond(payload):
                 self._respond(connection, request_id, {"running": True, **echo, **payload})
@@ -4390,6 +4524,9 @@ def build_application(show_on_start: bool = False):
                     return
                 if not isinstance(payload, dict):
                     failed("SoundCloud request failed")
+                    return
+                if needs_home and payload.get("needsHome") is True:
+                    needs_home()
                     return
                 error = _bounded_string(payload.get("error", ""), 128) or ""
                 if payload.get("collections"):

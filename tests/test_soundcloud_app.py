@@ -2009,7 +2009,7 @@ class BarWidgetTest(unittest.TestCase):
     def test_popup_has_larger_scrollable_home_and_feed_browser(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
 
-        self.assertIn("Style.space(408)", qml)
+        self.assertIn("Style.space(440)", qml)
         self.assertIn("Style.space(560)", qml)
         self.assertIn('text: "Home"', qml)
         self.assertIn('text: "Feed"', qml)
@@ -2412,3 +2412,99 @@ eval({json.dumps(app.api_request_capture_script())});
         self.assertEqual(result["liked"]["tracks"][0]["playbackId"], "soundcloud:tracks:8")
         self.assertEqual(result["volumes"], [0.3, 0.3])
         self.assertNotIn("private-test-value", completed.stdout)
+
+
+class MixesAndShuffleTest(unittest.TestCase):
+    PRELUDE = SearchAndPlayerHandoffTest.HARNESS_PRELUDE
+    api_track = staticmethod(QueueLibraryAndMprisTest.api_track)
+
+    def run_node(self, body):
+        completed = subprocess.run(["node", "-e", body], check=True, capture_output=True, text=True)
+        return completed, json.loads(completed.stdout)
+
+    def test_mix_and_shuffle_commands_are_bounded(self):
+        app = load_module()
+        self.assertEqual(app.collection_from_command("open:mix:3"), ("mix", 3))
+        self.assertIsNone(app.collection_from_command("open:mix:0"))
+        self.assertEqual(app.shuffle_from_command("shuffle:likes"), "likes")
+        self.assertEqual(app.shuffle_from_command("shuffle:collection"), "collection")
+        self.assertIsNone(app.shuffle_from_command("shuffle:everything"))
+        self.assertIsNone(app.shuffle_from_command("shuffle"))
+        mix = {"kind": "mix", "id": 1, "title": "Your Mix 1", "subtitle": "Mixed for you  •  30 tracks",
+               "url": "https://soundcloud.com/discover/sets/your-moods", "artUrl": ""}
+        self.assertEqual(app.validate_collections_payload({"collections": [mix]})[0]["kind"], "mix")
+
+    def test_shuffle_keeps_every_playable_track_and_avoids_the_current_one(self):
+        app = load_module()
+        tracks = [{"playbackId": f"soundcloud:tracks:{n}", "title": f"T{n}"} for n in range(1, 31)]
+        tracks.append({"playbackId": "not-a-track", "title": "Junk"})
+        for _ in range(20):
+            shuffled = app.shuffled_tracks(tracks, current="soundcloud:tracks:1")
+            self.assertEqual(sorted(t["playbackId"] for t in shuffled),
+                             sorted(t["playbackId"] for t in tracks[:30]))
+            self.assertNotEqual(shuffled[0]["playbackId"], "soundcloud:tracks:1")
+        self.assertEqual(app.shuffled_tracks([]), [])
+        self.assertEqual(len(app.shuffled_tracks(tracks * 5)), app.MAX_QUEUE)
+
+    def test_mixes_come_from_home_selections_and_open_in_mix_order(self):
+        app = load_module()
+        selections = json.dumps({"collection": [
+            {"kind": "selection", "urn": "soundcloud:selections:buzzing", "title": "Artists to watch",
+             "items": {"collection": [{"kind": "playlist", "id": 900, "title": "Buzzing",
+                                       "track_count": 12, "permalink_url": "https://soundcloud.com/x/sets/b",
+                                       "user": {}}]}},
+            {"kind": "selection", "urn": "soundcloud:selections:your-moods", "title": "Mixed for you",
+             "items": {"collection": [
+                 {"kind": "system-playlist", "urn": "soundcloud:system-playlists:your-moods:1:1",
+                  "title": "Your Mix 1", "permalink_url": "https://soundcloud.com/discover/sets/m1",
+                  "tracks": [{"id": 3}, {"id": 2}]},
+                 {"kind": "system-playlist", "urn": "soundcloud:system-playlists:your-moods:1:1",
+                  "title": "Your Mix 1 again", "tracks": [{"id": 3}]},
+                 {"kind": "system-playlist", "urn": "soundcloud:system-playlists:empty", "title": "Empty",
+                  "tracks": []},
+             ]}},
+        ]})
+        stubs = json.dumps([self.api_track(2, "Second"), self.api_track(3, "Third")])
+        harness = self.PRELUDE + f"""
+global.document = {{ querySelector() {{ return null; }}, querySelectorAll() {{ return []; }} }};
+window.fetch = async function(input) {{
+  const url = typeof input === 'string' ? input : input.url;
+  calls.push(url);
+  let payload = {{ collection: [] }};
+  if (url.includes('/mixed-selections')) payload = {selections};
+  else if (url.includes('/tracks?')) payload = {stubs};
+  return new Response(JSON.stringify(payload), {{ status: 200 }});
+}};
+eval({json.dumps(app.api_request_capture_script())});
+(async () => {{
+  const before = JSON.parse(await window.__omarchyMixes());
+  await window.fetch(new Request('https://api-v2.soundcloud.com/mixed-selections?client_id=public-test',
+    {{ headers: {{ authorization: 'OAuth private-test-value' }} }}));
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  const mixes = JSON.parse(await window.__omarchyMixes());
+  const opened = JSON.parse(await window.__omarchyOpenCollection('mix', 1));
+  const missing = JSON.parse(await window.__omarchyOpenCollection('mix', 9));
+  process.stdout.write(JSON.stringify({{ before, mixes, opened, missing }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+        completed, result = self.run_node(harness)
+
+        self.assertTrue(result["before"]["needsHome"])
+        rows = result["mixes"]["collections"]
+        # Your mixes rank before other selections; duplicates and empty mixes are dropped.
+        self.assertEqual([(row["kind"], row["title"]) for row in rows],
+                         [("mix", "Your Mix 1"), ("playlist", "Buzzing")])
+        self.assertEqual(rows[0]["subtitle"], "Mixed for you  •  2 tracks")
+        self.assertIsNotNone(app.validate_collections_payload(result["mixes"]))
+        self.assertEqual([t["title"] for t in result["opened"]["tracks"]], ["Third", "Second"])
+        self.assertIn("error", result["missing"])
+        self.assertNotIn("private-test-value", completed.stdout)
+
+    def test_widget_has_mixes_tab_and_shuffle_button(self):
+        source = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        self.assertIn('onClicked: root.selectTab("mixes")', source)
+        self.assertIn('sendCommand("mixes", "mixes")', source)
+        self.assertIn('sendCommand("shuffle:" + listSource(), "action")', source)
+        self.assertIn("onClicked: root.shuffleCurrentList()", source)
+        self.assertIn('openedCollection.tab', source)
