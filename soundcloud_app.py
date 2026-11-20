@@ -792,6 +792,17 @@ def api_request_capture_script() -> str:
       const playbackTracks = new Map();
       let playbackGeneration = 0;
       let latestRequestContext = null;
+      // Any authenticated api-v2 request the frontend makes; search only needs
+      // its client id and authorization, not a Home/Feed route.
+      let latestApiContext = null;
+      const isApiV2 = (input) => {
+        try {
+          const request = input instanceof Request ? input : null;
+          const url = new URL(request ? request.url : input, location.href);
+          return url.protocol === 'https:' && url.hostname === 'api-v2.soundcloud.com'
+            && (!url.port || url.port === '443') && !url.username && !url.password;
+        } catch (_) { return false; }
+      };
       const routeGenerations = Object.create(null);
       const nextRouteGeneration = (path) => {
         const source = path === '/stream' ? 'feed' : 'home';
@@ -1242,6 +1253,11 @@ def api_request_capture_script() -> str:
         const context = path ? requestContext(input, init) : null;
         const routeGeneration = path ? nextRouteGeneration(path) : 0;
         if (context) latestRequestContext = context;
+        else if (isApiV2(input)) {
+          const apiContext = requestContext(input, init);
+          if (apiContext.headers.has('authorization') || new URL(apiContext.requestUrl).searchParams.has('client_id'))
+            latestApiContext = apiContext;
+        }
         markLoading(path);
         return originalFetch(input, init).then((response) => {
           if (path && response.ok) {
@@ -1274,15 +1290,16 @@ def api_request_capture_script() -> str:
         const path = routeFor(url);
         xhrRequests.set(this, {
           path,
+          api: !path && isApiV2(url),
           headers: new Headers(),
           credentials: 'include',
-          requestUrl: path ? new URL(url, location.href).href : ''
+          requestUrl: (path || isApiV2(url)) ? new URL(url, location.href).href : ''
         });
         return originalOpen.apply(this, arguments);
       };
       XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
         const context = xhrRequests.get(this);
-        if (context && context.path
+        if (context && (context.path || context.api)
             && /^(authorization|x-client-id|x-soundcloud-client-id)$/i.test(String(name))) {
           const bounded = String(value);
           if (bounded.length <= 2048) context.headers.set(String(name), bounded);
@@ -1294,6 +1311,7 @@ def api_request_capture_script() -> str:
         const path = context.path;
         const routeGeneration = path ? nextRouteGeneration(path) : 0;
         if (path) latestRequestContext = context;
+        else if (context.api) latestApiContext = context;
         markLoading(path);
         if (path) this.addEventListener('load', function() {
           if (this.status >= 200 && this.status < 300
@@ -1351,6 +1369,95 @@ def api_request_capture_script() -> str:
         ));
         return { started: true, hasMore: true };
       };
+      // Track SoundCloud's own web player so the backend can keep only one
+      // player audible and pause the page when its window closes.
+      const pageMedia = new Set();
+      if (typeof HTMLMediaElement !== 'undefined' && HTMLMediaElement.prototype
+          && typeof HTMLMediaElement.prototype.play === 'function') {
+        const originalPlay = HTMLMediaElement.prototype.play;
+        HTMLMediaElement.prototype.play = function() {
+          try {
+            if (pageMedia.size >= 16 && !pageMedia.has(this)) pageMedia.clear();
+            pageMedia.add(this);
+            window.webkit.messageHandlers.omarchyPlayback.postMessage(
+              JSON.stringify({ event: 'page-play' }));
+          } catch (_) {}
+          return originalPlay.apply(this, arguments);
+        };
+      }
+      const pageMediaElements = () => {
+        const media = new Set(pageMedia);
+        try {
+          for (const node of document.querySelectorAll('audio, video')) media.add(node);
+        } catch (_) {}
+        return media;
+      };
+      window.__omarchyPagePlaying = function() {
+        for (const item of pageMediaElements()) {
+          try { if (!item.paused && !item.ended) return true; } catch (_) {}
+        }
+        return false;
+      };
+      // SoundCloud plays through media elements it never attaches to the DOM.
+      window.__omarchyPageMediaState = function() {
+        let chosen = null;
+        for (const item of pageMediaElements()) {
+          try {
+            if (!item.paused && !item.ended) { chosen = item; break; }
+            chosen = item;
+          } catch (_) {}
+        }
+        if (!chosen) return { present: false, playing: false, duration: 0, position: 0 };
+        const duration = Number(chosen.duration);
+        const position = Number(chosen.currentTime);
+        return {
+          present: true,
+          playing: !chosen.paused && !chosen.ended,
+          duration: Number.isFinite(duration) && duration > 0 ? duration : 0,
+          position: Number.isFinite(position) && position > 0 ? position : 0
+        };
+      };
+      window.__omarchyPausePage = function() {
+        if (!window.__omarchyPagePlaying()) return false;
+        try {
+          const control = document.querySelector('.playControls__play.playing, .playControl.playing');
+          if (control) control.click();
+        } catch (_) {}
+        for (const item of pageMediaElements()) {
+          try { if (!item.paused) item.pause(); } catch (_) {}
+        }
+        return true;
+      };
+      window.__omarchySearch = async function(value) {
+        const query = String(value || '').trim().slice(0, 200);
+        if (!query) return JSON.stringify({ tracks: [] });
+        const context = latestRequestContext || latestApiContext;
+        if (!context || !(context.headers instanceof Headers))
+          return JSON.stringify({ tracks: [], error: 'SoundCloud is still loading, try again in a moment' });
+        try {
+          const request = new URL(context.requestUrl);
+          if (request.protocol !== 'https:' || request.hostname !== 'api-v2.soundcloud.com'
+              || request.port || request.username || request.password)
+            throw new Error('search unavailable');
+          const clientId = request.searchParams.get('client_id');
+          request.pathname = '/search/tracks';
+          request.search = '';
+          request.searchParams.set('q', query);
+          request.searchParams.set('limit', '40');
+          if (clientId) request.searchParams.set('client_id', clientId);
+          const response = await originalFetch(request.href, {
+            method: 'GET', headers: context.headers, credentials: context.credentials,
+            cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer'
+          });
+          if (!response.ok)
+            return JSON.stringify({ tracks: [], error: 'SoundCloud search failed (HTTP ' + response.status + ')' });
+          const text = await boundedText(response, 2 * 1024 * 1024);
+          if (!text.length) throw new Error('empty search response');
+          return JSON.stringify({ tracks: normalise(JSON.parse(text), context).slice(0, 50) });
+        } catch (_) {
+          return JSON.stringify({ tracks: [], error: 'SoundCloud search failed' });
+        }
+      };
     })()"""
 
 
@@ -1401,7 +1508,9 @@ def play_track_script(playback_id: str, request_id: int) -> str | None:
 def status_script() -> str:
     return r"""(() => {
       const audio = document.querySelector('audio');
-      const playerPresent = !!audio;
+      const hooked = typeof window.__omarchyPageMediaState === 'function'
+        ? window.__omarchyPageMediaState() : { present: false, playing: false, duration: 0, position: 0 };
+      const playerPresent = !!audio || hooked.present === true;
       const playControl = document.querySelector('.playControls__play, .playControl');
       const controlSaysPause = !!playControl && (
         playControl.classList.contains('playing') ||
@@ -1442,9 +1551,11 @@ def status_script() -> str:
         const match = background.match(/url\(["']?(.*?)["']?\)/);
         if (match) { artUrl = match[1].slice(0, 2048); break; }
       }
+      const pagePlaying = (!!audio && !audio.paused) || hooked.playing === true;
       return {
         playerPresent,
-        playing: playerPresent ? !audio.paused : false,
+        pagePlaying,
+        playing: playerPresent ? pagePlaying : false,
         title: playerPresent
           ? text('.playbackSoundBadge__titleLink span[aria-hidden="true"]', '.playbackSoundBadge__titleLink') : '',
         artist: playerPresent
@@ -1453,8 +1564,10 @@ def status_script() -> str:
         loggedIn: !/^\/(signin|register)/.test(location.pathname) &&
           !!document.querySelector('.header__userNavButton, a[href*="/you/library"]'),
         url: location.href,
-        duration: playerPresent && isFinite(audio.duration) ? audio.duration : 0,
-        position: playerPresent && isFinite(audio.currentTime) ? audio.currentTime : 0
+        duration: audio && isFinite(audio.duration) ? audio.duration
+          : (playerPresent ? (hooked.duration || timelineDuration) : 0),
+        position: audio && isFinite(audio.currentTime) ? audio.currentTime
+          : (playerPresent ? (hooked.position || timelinePosition) : 0)
       };
     })()"""
 
@@ -1912,8 +2025,31 @@ def command_script(action: str) -> str | None:
           const button = document.querySelector('.skipControl__previous, button[title="Previous"], button[aria-label="Previous"]');
           if (!button) return false; button.click(); return true;
         })()""",
+        "pause-page": r"""(() => {
+          if (typeof window.__omarchyPausePage === 'function') window.__omarchyPausePage();
+          return true;
+        })()""",
     }
     return scripts.get(action)
+
+
+# Runs through call_async_javascript_function, which awaits the promise.
+SEARCH_TRACKS_FUNCTION = """
+if (typeof window.__omarchySearch !== 'function')
+  return JSON.stringify({ tracks: [], error: 'SoundCloud is still loading' });
+return await window.__omarchySearch(query);
+"""
+MAX_SEARCH_QUERY_BYTES = 200
+
+
+def search_query_from_command(command: str) -> str | None:
+    if not command.startswith("search:"):
+        return None
+    query = command.removeprefix("search:").strip()
+    if (not query or len(query.encode("utf-8")) > MAX_SEARCH_QUERY_BYTES
+            or any(ord(character) < 32 or ord(character) == 127 for character in query)):
+        return None
+    return query
 
 
 def seek_script(ratio: float) -> str:
@@ -2487,6 +2623,11 @@ class GstPlayback:
         target = self.Gst.State.PAUSED if self.playing else self.Gst.State.PLAYING
         return self.current.set_state(target) != self.Gst.StateChangeReturn.FAILURE
 
+    def pause(self) -> bool:
+        if not self.active or self.current is None:
+            return False
+        return self.current.set_state(self.Gst.State.PAUSED) != self.Gst.StateChangeReturn.FAILURE
+
     def seek(self, ratio: float) -> bool:
         if not self.active:
             return False
@@ -2840,6 +2981,8 @@ def build_application(show_on_start: bool = False):
                 if is_playback_id(track.get("playbackId"))
             }
             self.selection_generation = 0
+            # True while SoundCloud's own web player (inside the WebKit view) is audible.
+            self.page_playing = False
             self.track_cache_save_pending = False
             self.had_subscriber = False
             self.disconnect_generation = 0
@@ -3023,6 +3166,13 @@ def build_application(show_on_start: bool = False):
                 payload = json.loads(raw)
                 if not isinstance(payload, dict):
                     return
+                if payload.get("event") == "page-play":
+                    # The web player started: it wins, so only one player is audible.
+                    self.page_playing = True
+                    if self.playback.playing:
+                        self.playback.pause()
+                    GLib.timeout_add(150, self._publish_status_once)
+                    return
                 request_id = payload.get("requestId")
                 if (isinstance(request_id, bool) or not isinstance(request_id, int)
                         or request_id != self.selection_generation):
@@ -3120,6 +3270,9 @@ def build_application(show_on_start: bool = False):
 
         def _hide_window(self, *_args):
             self.window.hide()
+            # Closing the window stops SoundCloud's web player; the bar's own
+            # player is unaffected.
+            self._evaluate(command_script("pause-page"), lambda _payload: self._publish_status_once())
             return True
 
         def show_login(self):
@@ -3194,9 +3347,15 @@ def build_application(show_on_start: bool = False):
             GLib.idle_add(self._publish_status_once)
 
         def _secure_status(self, payload):
-            if self.playback.state != "idle":
+            if isinstance(payload, dict) and "pagePlaying" in payload:
+                self.page_playing = payload.get("pagePlaying") is True
+            # Show whichever player is audible; the bar's player only when the
+            # web player is not.
+            if self.playback.state != "idle" and not (self.page_playing and not self.playback.playing):
                 base = payload if isinstance(payload, dict) else {}
                 payload = {**base, **self.playback.status()}
+            elif self.page_playing and isinstance(payload, dict):
+                payload = {**payload, "playing": True, "playbackState": "playing"}
             state = validate_status_payload(payload)
             if state is None:
                 return {}
@@ -3391,26 +3550,43 @@ def build_application(show_on_start: bool = False):
                             data_url,
                         ),
                     )
-            elif command in {"play-pause", "next", "previous"}:
-                if command == "play-pause" and self.playback.active:
-                    self._respond(
+            elif command == "play-pause":
+                # Act on whichever player is audible, and never leave two playing.
+                def toggle_audible_player(payload):
+                    page_playing = isinstance(payload, dict) and payload.get("pagePlaying") is True
+                    self.page_playing = page_playing
+                    respond = lambda result: self._respond(
                         connection,
                         request_id,
-                        {"ok": self.playback.toggle(), "running": True},
+                        {"ok": bool(result), "running": True},
                         publish_status=True,
                     )
-                else:
-                    if self.playback.active or self.playback.error:
-                        self.playback.stop()
-                    self._evaluate(
-                        command_script(command),
-                        lambda payload: self._respond(
-                            connection,
-                            request_id,
-                            {"ok": bool(payload), "running": True},
-                            publish_status=True,
-                        ),
-                    )
+                    if page_playing:
+                        if self.playback.playing:
+                            self.playback.pause()
+                        self._evaluate(command_script("pause-page"), respond)
+                    elif self.playback.active:
+                        respond(self.playback.toggle())
+                    else:
+                        self._evaluate(command_script("play-pause"), respond)
+
+                self._evaluate(status_script(), toggle_audible_player)
+            elif command in {"next", "previous"}:
+                if self.playback.active or self.playback.error:
+                    self.playback.stop()
+                self._evaluate(
+                    command_script(command),
+                    lambda payload: self._respond(
+                        connection,
+                        request_id,
+                        {"ok": bool(payload), "running": True},
+                        publish_status=True,
+                    ),
+                )
+            elif (query := search_query_from_command(command)) is not None:
+                self._search_tracks(query, connection, request_id)
+            elif command.startswith("search:"):
+                self._respond(connection, request_id, {"ok": False, "error": "Enter a shorter search"})
             elif command.startswith("seek:"):
                 try:
                     ratio = float(command.partition(":")[2])
@@ -3421,7 +3597,7 @@ def build_application(show_on_start: bool = False):
                         {"ok": False, "error": "invalid seek position"},
                     )
                 else:
-                    if self.playback.active:
+                    if self.playback.active and not self.page_playing:
                         self._respond(
                             connection,
                             request_id,
@@ -3506,6 +3682,54 @@ def build_application(show_on_start: bool = False):
             else:
                 self._respond(connection, request_id, {"ok": False, "error": "unknown command"})
             return False
+
+        def _search_tracks(self, query, connection, request_id):
+            def failed(error):
+                self._respond(connection, request_id, {
+                    "ok": False, "running": True, "query": query, "tracks": [], "error": error,
+                })
+
+            def finished(webview, async_result, _data):
+                try:
+                    value = webview.call_async_javascript_function_finish(async_result)
+                    raw = value.to_string() if value.is_string() else ""
+                    if not raw or len(raw.encode("utf-8")) > MAX_RESPONSE_BYTES:
+                        failed("SoundCloud search failed")
+                        return
+                    payload = json.loads(raw)
+                except Exception:
+                    failed("SoundCloud search failed")
+                    return
+                if not isinstance(payload, dict):
+                    failed("SoundCloud search failed")
+                    return
+                validated = validate_tracks_payload({"tracks": payload.get("tracks")})
+                if validated is None:
+                    failed("SoundCloud returned invalid search results")
+                    return
+                for track in validated["tracks"]:
+                    playback_id = track.get("playbackId")
+                    if is_playback_id(playback_id):
+                        self.playback_tracks[playback_id] = track
+                while len(self.playback_tracks) > MAX_TRACKS * 3:
+                    self.playback_tracks.pop(next(iter(self.playback_tracks)))
+                result = self._secure_tracks(validated) or {"tracks": []}
+                error = _bounded_string(payload.get("error", ""), 128) or ""
+                self._respond(connection, request_id, {
+                    "ok": not error,
+                    "running": True,
+                    "query": query,
+                    **result,
+                    **({"error": error} if error else {}),
+                })
+
+            if not self.webview or not is_soundcloud_uri(self.webview.get_uri() or ""):
+                failed("SoundCloud is still loading")
+                return
+            arguments = GLib.Variant("a{sv}", {"query": GLib.Variant("s", query)})
+            self.webview.call_async_javascript_function(
+                SEARCH_TRACKS_FUNCTION, -1, arguments, None, None, None, finished, None
+            )
 
         def _write_like_in_page(self, user_id, track_id, liked, token):
             """Run on a worker thread; blocks until the page's fetch finishes."""
