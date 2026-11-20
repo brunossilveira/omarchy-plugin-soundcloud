@@ -11,10 +11,30 @@ without official SoundCloud API credentials.
 ## Features
 
 - Current track, artist, and artwork, with the bar icon highlighted during playback
+- Small artwork, a scrolling title, and previous/play-pause/next/like buttons in
+  the bar itself while a track is loaded
 - Play/pause, previous, and next controls
 - SoundCloud-style waveform progress display with click-to-seek
 - Heart button to like or unlike the current track on your SoundCloud account
 - Home and Feed tabs that load more tracks as you scroll
+- Likes tab with your liked tracks
+- Search tab for tracks, playlists, and artists; open a playlist or artist to see
+  and play its tracks
+- Mixes tab with your SoundCloud mixes, "More of what you like" related-track
+  lists, artist stations, and recommended playlists; open one to play its tracks
+- Shuffle button plays the current list (Home, Feed, Likes, a mix or playlist, or
+  track search results) in random order
+- Next/previous walk the list a track was played from, and the next track starts
+  when one ends; previous restarts the track after its first 3 seconds
+- When a list runs out, playback carries on with tracks related to the last one
+- Volume slider in the popup; scroll over the bar's play button to change volume
+- Media keys and Omarchy's media controls work through MPRIS
+- The last track, its position, its list, and the volume are remembered across
+  restarts; press play to resume where you stopped
+- Opening Home or Feed keeps a track loaded in SoundCloud's web player instead of
+  reloading the page; the refresh button reloads the list on demand
+- Only one player is ever audible: starting SoundCloud's web player pauses the bar's
+  player and vice versa, and closing the SoundCloud window pauses the web player
 - Persistent SoundCloud login session
 - Local audio playback through GStreamer
 
@@ -66,6 +86,16 @@ omarchy-shell shell toggle brunosilveira.soundcloud
 You only need to sign in once. Closing the window hides it; the playback backend
 keeps running.
 
+## Bar settings
+
+Add these to the widget's entry in `~/.config/omarchy/shell.json`:
+
+- `"showTitle": false` hides the artwork and scrolling title
+- `"titleWidth": 220` sets the title width before it scrolls (default 170)
+- `"showControls": false` hides the bar's playback and like buttons
+
+The title and buttons only show on horizontal bars.
+
 ## Controls
 
 - Click: open or close the popup
@@ -73,7 +103,8 @@ keeps running.
 - Right-click: next track
 - Mouse wheel: previous/next
 - Popup: artwork, metadata, playback controls, and a seekable waveform
-- Home and Feed tabs: click a track to play it
+- Home, Feed, and Search tabs: click a track to play it
+- Bar buttons: previous, play/pause, next, and like for the loaded track
 
 ## Troubleshooting
 
@@ -104,6 +135,7 @@ not require another sign-in:
 
 - `cookies.json`: the SoundCloud session cookies
 - `tracks.json`: the cached Home and Feed track lists (titles, artists, links)
+- `player.json`: the volume, last track, its position, and its list
 
 The runtime directory `$XDG_RUNTIME_DIR/omarchy-soundcloud/` (lock file and the
 optional `pagination.log`) is also kept until logout.

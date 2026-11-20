@@ -241,6 +241,17 @@ class UriPolicyTest(unittest.TestCase):
         self.assertFalse(app.is_bot_check_uri("https://user@geo.captcha-delivery.com/"))
         self.assertFalse(app.is_bot_check_uri("https://example.org/captcha/"))
 
+    def test_sign_in_provider_uris(self):
+        app = load_module()
+        self.assertTrue(app.is_sign_in_provider_uri("https://accounts.google.com/o/oauth2/v2/auth?x=1"))
+        self.assertTrue(app.is_sign_in_provider_uri("https://accounts.google.co.za/accounts/SetSID"))
+        self.assertTrue(app.is_sign_in_provider_uri("https://appleid.apple.com/auth/authorize"))
+        self.assertTrue(app.is_sign_in_provider_uri("https://www.facebook.com/v12.0/dialog/oauth"))
+        self.assertFalse(app.is_sign_in_provider_uri("http://accounts.google.com/"))
+        self.assertFalse(app.is_sign_in_provider_uri("https://accounts.google.com.example.org/"))
+        self.assertFalse(app.is_sign_in_provider_uri("https://user@accounts.google.com/"))
+        self.assertFalse(app.is_sign_in_provider_uri("https://evil.google.com/"))
+
 
 class GraphicsWorkaroundTest(unittest.TestCase):
     def test_disables_webkit_dmabuf_on_hyprland(self):
@@ -457,8 +468,8 @@ class BackendCommandTest(unittest.TestCase):
         app = load_module()
         script = app.status_script()
 
-        self.assertIn("const playerPresent = !!audio", script)
-        self.assertIn("playing: playerPresent ? !audio.paused : false", script)
+        self.assertIn("const playerPresent = !!audio || hooked.present === true", script)
+        self.assertIn("playing: playerPresent ? pagePlaying : false", script)
         self.assertIn("artUrl: playerPresent ? artUrl : ''", script)
         validated = app.validate_status_payload({
             "playerPresent": False,
@@ -1988,7 +1999,9 @@ class BarWidgetTest(unittest.TestCase):
     def test_popup_uses_seekable_waveform_instead_of_feed_buttons(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
 
-        self.assertNotIn('text: "Likes"', qml)
+        # Likes is a list tab fed by the API, not a button that navigates the page.
+        self.assertNotIn('runAction("likes"', qml)
+        self.assertIn('sendCommand("likes", "likes")', qml)
         self.assertNotIn('text: "Following"', qml)
         self.assertIn("Canvas {", qml)
         self.assertIn('root.runAction("seek"', qml)
@@ -1996,8 +2009,8 @@ class BarWidgetTest(unittest.TestCase):
     def test_popup_has_larger_scrollable_home_and_feed_browser(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
 
-        self.assertIn("Style.space(408)", qml)
-        self.assertIn("Style.space(480)", qml)
+        self.assertIn("Style.space(440)", qml)
+        self.assertIn("Style.space(560)", qml)
         self.assertIn('text: "Home"', qml)
         self.assertIn('text: "Feed"', qml)
         self.assertIn("ListView {", qml)
@@ -2132,3 +2145,422 @@ class BarWidgetTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SearchAndPlayerHandoffTest(unittest.TestCase):
+    HARNESS_PRELUDE = """
+const playback = [];
+const calls = [];
+global.location = { href: 'https://soundcloud.com/discover', hostname: 'soundcloud.com', pathname: '/discover' };
+global.window = global;
+window.webkit = { messageHandlers: {
+  omarchyTracks: { postMessage() {} },
+  omarchyPlayback: { postMessage(value) { playback.push(JSON.parse(value)); } }
+} };
+global.XMLHttpRequest = function() {};
+XMLHttpRequest.prototype.open = function() {};
+XMLHttpRequest.prototype.setRequestHeader = function() {};
+XMLHttpRequest.prototype.send = function() {};
+XMLHttpRequest.prototype.addEventListener = function() {};
+"""
+
+    def run_node(self, body):
+        completed = subprocess.run(["node", "-e", body], check=True, capture_output=True, text=True)
+        return completed, json.loads(completed.stdout)
+
+    def test_search_command_accepts_only_bounded_printable_queries(self):
+        app = load_module()
+        self.assertEqual(app.search_query_from_command("search:  daft punk "), "daft punk")
+        self.assertIsNone(app.search_query_from_command("search:"))
+        self.assertIsNone(app.search_query_from_command("search:   "))
+        self.assertIsNone(app.search_query_from_command("search:a\nb"))
+        self.assertIsNone(app.search_query_from_command("search:" + "x" * 201))
+        self.assertIsNone(app.search_query_from_command("play:soundcloud:tracks:1"))
+
+    def test_search_uses_the_frontends_api_context_and_registers_playable_tracks(self):
+        app = load_module()
+        harness = self.HARNESS_PRELUDE + f"""
+global.document = {{ querySelector() {{ return null; }}, querySelectorAll() {{ return []; }} }};
+window.fetch = async function(input) {{
+  const url = typeof input === 'string' ? input : input.url;
+  calls.push(url);
+  let payload = {{ collection: [] }};
+  if (url.includes('/search/tracks')) payload = {{ collection: [{{
+    kind: 'track', id: 55, urn: 'soundcloud:tracks:55',
+    permalink_url: 'https://soundcloud.com/a/found', title: 'Found', duration: 4000,
+    user: {{ username: 'A' }}, media: {{ transcodings: [{{
+      url: 'https://api-v2.soundcloud.com/media/found',
+      format: {{ protocol: 'progressive', mime_type: 'audio/mpeg' }}
+    }}] }}
+  }}] }};
+  return new Response(JSON.stringify(payload), {{ status: 200 }});
+}};
+eval({json.dumps(app.api_request_capture_script())});
+(async () => {{
+  const before = JSON.parse(await window.__omarchySearch('found'));
+  await window.fetch(new Request('https://api-v2.soundcloud.com/mixed-selections?client_id=public-test',
+    {{ headers: {{ authorization: 'OAuth private-test-value' }} }}));
+  await new Promise(setImmediate);
+  const after = JSON.parse(await window.__omarchySearch('  found  '));
+  process.stdout.write(JSON.stringify({{ before, after, calls, count: window.__omarchyPlaybackTrackCount() }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+        completed, result = self.run_node(harness)
+
+        self.assertEqual(result["before"]["tracks"], [])
+        self.assertIn("error", result["before"])
+        search_call = [call for call in result["calls"] if "/search/tracks" in call][0]
+        self.assertTrue(search_call.startswith("https://api-v2.soundcloud.com/search/tracks?"))
+        self.assertIn("q=found&", search_call)
+        self.assertIn("client_id=public-test", search_call)
+        self.assertEqual(result["after"]["tracks"][0]["playbackId"], "soundcloud:tracks:55")
+        self.assertGreaterEqual(result["count"], 1)
+        self.assertNotIn("private-test-value", completed.stdout)
+        validated = app.validate_tracks_payload(result["after"])
+        self.assertEqual(validated["tracks"][0]["title"], "Found")
+
+    def test_web_player_reports_play_and_can_be_paused(self):
+        app = load_module()
+        harness = self.HARNESS_PRELUDE + f"""
+class FakeMedia {{
+  constructor() {{ this.paused = true; this.ended = false; }}
+  play() {{ this.paused = false; return Promise.resolve(); }}
+  pause() {{ this.paused = true; }}
+}}
+global.HTMLMediaElement = FakeMedia;
+global.document = {{ querySelector() {{ return null; }}, querySelectorAll() {{ return []; }} }};
+window.fetch = async () => new Response('{{}}', {{ status: 200 }});
+eval({json.dumps(app.api_request_capture_script())});
+const media = new FakeMedia();
+const idle = window.__omarchyPagePlaying();
+media.play();
+const playing = window.__omarchyPagePlaying();
+const paused = window.__omarchyPausePage();
+process.stdout.write(JSON.stringify({{ idle, playing, paused, after: window.__omarchyPagePlaying(),
+  mediaPaused: media.paused, events: playback }}));
+"""
+        _completed, result = self.run_node(harness)
+
+        self.assertFalse(result["idle"])
+        self.assertTrue(result["playing"])
+        self.assertTrue(result["paused"])
+        self.assertFalse(result["after"])
+        self.assertTrue(result["mediaPaused"])
+        self.assertEqual(result["events"], [{"event": "page-play"}])
+
+    def test_pause_page_script_is_safe_before_the_page_hooks_load(self):
+        app = load_module()
+        script = app.command_script("pause-page")
+        harness = f"global.window = global; process.stdout.write(JSON.stringify(eval({json.dumps(script)})));"
+        _completed, result = self.run_node(harness)
+        self.assertTrue(result)
+
+
+class QueueLibraryAndMprisTest(unittest.TestCase):
+    PRELUDE = SearchAndPlayerHandoffTest.HARNESS_PRELUDE
+
+    def run_node(self, body):
+        completed = subprocess.run(["node", "-e", body], check=True, capture_output=True, text=True)
+        return completed, json.loads(completed.stdout)
+
+    @staticmethod
+    def api_track(number, title=None):
+        return {
+            "kind": "track", "id": number, "urn": f"soundcloud:tracks:{number}",
+            "permalink_url": f"https://soundcloud.com/a/t{number}", "title": title or f"T{number}",
+            "duration": 1000, "user": {"username": "A"},
+            "media": {"transcodings": [{
+                "url": f"https://api-v2.soundcloud.com/media/{number}",
+                "format": {"protocol": "progressive", "mime_type": "audio/mpeg"},
+            }]},
+        }
+
+    def test_command_parsers_accept_only_bounded_known_forms(self):
+        app = load_module()
+        self.assertEqual(app.search_from_command("search-playlists: dnb "), ("playlists", "dnb"))
+        self.assertEqual(app.search_from_command("search-users:netsky"), ("users", "netsky"))
+        self.assertEqual(app.search_from_command("search:x"), ("tracks", "x"))
+        self.assertIsNone(app.search_from_command("search-albums:x"))
+        self.assertEqual(app.collection_from_command("open:playlist:12"), ("playlist", 12))
+        self.assertIsNone(app.collection_from_command("open:playlist:0"))
+        self.assertIsNone(app.collection_from_command("open:album:12"))
+        self.assertEqual(app.queued_play_from_command("play-in:likes:soundcloud:tracks:5"),
+                         ("likes", "soundcloud:tracks:5"))
+        self.assertIsNone(app.queued_play_from_command("play-in:other:soundcloud:tracks:5"))
+        self.assertIsNone(app.queued_play_from_command("play-in:likes:soundcloud:tracks:0"))
+        self.assertEqual(app.volume_from_command("volume:0.25"), 0.25)
+        self.assertEqual(app.volume_from_command("volume:7"), 1.0)
+        self.assertIsNone(app.volume_from_command("volume:nan"))
+        self.assertIsNone(app.volume_from_command("volume:loud"))
+
+    def test_queue_steps_stop_at_both_ends(self):
+        app = load_module()
+        self.assertEqual(app.queue_step(3, 0, 1), 1)
+        self.assertEqual(app.queue_step(3, 1, -1), 0)
+        self.assertIsNone(app.queue_step(3, 2, 1))
+        self.assertIsNone(app.queue_step(3, 0, -1))
+        self.assertIsNone(app.queue_step(0, -1, 1))
+
+    def test_collections_are_validated_and_offsite_artwork_dropped(self):
+        app = load_module()
+        valid = {"kind": "playlist", "id": 9, "title": "Mix", "subtitle": "A  •  3 tracks",
+                 "url": "https://soundcloud.com/a/sets/mix", "artUrl": "https://evil.example/x.jpg"}
+        result = app.validate_collections_payload({"collections": [valid]})
+        self.assertEqual(result[0]["artUrl"], "")
+        self.assertIsNone(app.validate_collections_payload({"collections": [{**valid, "kind": "album"}]}))
+        self.assertIsNone(app.validate_collections_payload({"collections": [{**valid, "url": "https://evil.example/"}]}))
+        self.assertIsNone(app.validate_collections_payload({"collections": [{**valid, "id": True}]}))
+
+    def test_saved_player_state_is_revalidated(self):
+        app = load_module()
+        track = {"playbackId": "soundcloud:tracks:5", "title": "T", "artist": "A",
+                 "url": "https://soundcloud.com/a/t", "artUrl": "", "durationMs": 1000}
+        other = {**track, "playbackId": "soundcloud:tracks:6", "url": "https://soundcloud.com/a/u"}
+        state = app.sanitize_player_state({
+            "volume": 0.4, "track": track, "position": 12.5,
+            "queue": [other, track], "queueIndex": 1, "queueSource": "likes",
+        })
+        self.assertEqual(state["volume"], 0.4)
+        self.assertEqual(state["track"]["playbackId"], "soundcloud:tracks:5")
+        self.assertEqual(state["queueIndex"], 1)
+        # A queue whose index does not point at the saved track is dropped.
+        mismatched = app.sanitize_player_state({"track": track, "queue": [other, track],
+                                                "queueIndex": 0, "queueSource": "likes"})
+        self.assertNotIn("queue", mismatched)
+        self.assertEqual(app.sanitize_player_state({"volume": 3, "track": {**track, "url": "https://evil.example/"}}), {})
+        self.assertEqual(app.sanitize_player_state("junk"), {})
+
+    def test_mpris_properties_describe_the_current_track(self):
+        app = load_module()
+        state = {"title": "Rio", "artist": "NETSKY", "playing": True, "duration": 229.15,
+                 "playbackId": "soundcloud:tracks:210032350"}
+        properties = app.mpris_player_properties(state, "https://i1.sndcdn.com/artworks-x-t300x300.jpg", 0.5)
+        metadata = properties["Metadata"][1]
+        self.assertEqual(properties["PlaybackStatus"], ("s", "Playing"))
+        self.assertEqual(metadata["mpris:trackid"], ("o", "/org/mpris/MediaPlayer2/track/210032350"))
+        self.assertEqual(metadata["xesam:artist"], ("as", ["NETSKY"]))
+        self.assertEqual(metadata["mpris:length"], ("x", 229150000))
+        self.assertIn("mpris:artUrl", metadata)
+        idle = app.mpris_player_properties({}, "https://evil.example/x.jpg", 1.0)
+        self.assertEqual(idle["PlaybackStatus"], ("s", "Stopped"))
+        self.assertNotIn("mpris:artUrl", idle["Metadata"][1])
+        self.assertEqual(idle["CanGoNext"], ("b", False))
+
+    def test_playlist_expands_stub_tracks_in_playlist_order(self):
+        app = load_module()
+        full = json.dumps(self.api_track(1, "First"))
+        stubs = json.dumps([self.api_track(3, "Third"), self.api_track(2, "Second")])
+        harness = self.PRELUDE + f"""
+global.document = {{ querySelector() {{ return null; }}, querySelectorAll() {{ return []; }} }};
+window.fetch = async function(input) {{
+  const url = typeof input === 'string' ? input : input.url;
+  calls.push(url);
+  let payload = {{ collection: [] }};
+  if (url.includes('/playlists/77')) payload = {{ tracks: [{full}, {{ id: 2, kind: 'track' }}, {{ id: 3, kind: 'track' }}] }};
+  else if (url.includes('/tracks?')) payload = {stubs};
+  return new Response(JSON.stringify(payload), {{ status: 200 }});
+}};
+eval({json.dumps(app.api_request_capture_script())});
+(async () => {{
+  await window.fetch(new Request('https://api-v2.soundcloud.com/stream?client_id=public-test',
+    {{ headers: {{ authorization: 'OAuth private-test-value' }} }}));
+  await new Promise(setImmediate);
+  const opened = JSON.parse(await window.__omarchyOpenCollection('playlist', 77));
+  const refused = JSON.parse(await window.__omarchyOpenCollection('album', 77));
+  process.stdout.write(JSON.stringify({{ opened, refused, calls }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+        completed, result = self.run_node(harness)
+
+        self.assertEqual([track["title"] for track in result["opened"]["tracks"]], ["First", "Second", "Third"])
+        self.assertTrue(any("ids=2%2C3" in call or "ids=2,3" in call for call in result["calls"]))
+        self.assertIn("error", result["refused"])
+        self.assertNotIn("private-test-value", completed.stdout)
+
+    def test_likes_read_the_signed_in_account_and_volume_reaches_page_media(self):
+        app = load_module()
+        likes = json.dumps({"collection": [{"track": self.api_track(8, "Liked")}]})
+        harness = self.PRELUDE + f"""
+class FakeMedia {{ constructor() {{ this.paused = true; this.volume = 1; }}
+  play() {{ this.paused = false; return Promise.resolve(); }} pause() {{ this.paused = true; }} }}
+global.HTMLMediaElement = FakeMedia;
+global.document = {{ querySelector() {{ return null; }}, querySelectorAll() {{ return []; }} }};
+window.fetch = async function(input) {{
+  const url = typeof input === 'string' ? input : input.url;
+  calls.push(url);
+  let payload = {{ collection: [] }};
+  if (url.includes('/me?') || url.endsWith('/me')) payload = {{ id: 42 }};
+  else if (url.includes('/users/42/track_likes')) payload = {likes};
+  return new Response(JSON.stringify(payload), {{ status: 200 }});
+}};
+eval({json.dumps(app.api_request_capture_script())});
+(async () => {{
+  await window.fetch(new Request('https://api-v2.soundcloud.com/me/library?client_id=public-test',
+    {{ headers: {{ authorization: 'OAuth private-test-value' }} }}));
+  const liked = JSON.parse(await window.__omarchyLikes());
+  const media = new FakeMedia();
+  media.play();
+  window.__omarchySetVolume(0.3);
+  const later = new FakeMedia();
+  later.play();
+  process.stdout.write(JSON.stringify({{ liked, volumes: [media.volume, later.volume], calls }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+        completed, result = self.run_node(harness)
+
+        self.assertEqual(result["liked"]["tracks"][0]["title"], "Liked")
+        self.assertEqual(result["liked"]["tracks"][0]["playbackId"], "soundcloud:tracks:8")
+        self.assertEqual(result["volumes"], [0.3, 0.3])
+        self.assertNotIn("private-test-value", completed.stdout)
+
+
+class MixesAndShuffleTest(unittest.TestCase):
+    PRELUDE = SearchAndPlayerHandoffTest.HARNESS_PRELUDE
+    api_track = staticmethod(QueueLibraryAndMprisTest.api_track)
+
+    def run_node(self, body):
+        completed = subprocess.run(["node", "-e", body], check=True, capture_output=True, text=True)
+        return completed, json.loads(completed.stdout)
+
+    def test_mix_and_shuffle_commands_are_bounded(self):
+        app = load_module()
+        self.assertEqual(app.collection_from_command("open:mix:3"), ("mix", 3))
+        self.assertIsNone(app.collection_from_command("open:mix:0"))
+        self.assertEqual(app.shuffle_from_command("shuffle:likes"), "likes")
+        self.assertEqual(app.shuffle_from_command("shuffle:collection"), "collection")
+        self.assertIsNone(app.shuffle_from_command("shuffle:everything"))
+        self.assertIsNone(app.shuffle_from_command("shuffle"))
+        mix = {"kind": "mix", "id": 1, "title": "Your Mix 1", "subtitle": "Mixed for you  •  30 tracks",
+               "url": "https://soundcloud.com/discover/sets/your-moods", "artUrl": ""}
+        self.assertEqual(app.validate_collections_payload({"collections": [mix]})[0]["kind"], "mix")
+
+    def test_shuffle_keeps_every_playable_track_and_avoids_the_current_one(self):
+        app = load_module()
+        tracks = [{"playbackId": f"soundcloud:tracks:{n}", "title": f"T{n}"} for n in range(1, 31)]
+        tracks.append({"playbackId": "not-a-track", "title": "Junk"})
+        for _ in range(20):
+            shuffled = app.shuffled_tracks(tracks, current="soundcloud:tracks:1")
+            self.assertEqual(sorted(t["playbackId"] for t in shuffled),
+                             sorted(t["playbackId"] for t in tracks[:30]))
+            self.assertNotEqual(shuffled[0]["playbackId"], "soundcloud:tracks:1")
+        self.assertEqual(app.shuffled_tracks([]), [])
+        self.assertEqual(len(app.shuffled_tracks(tracks * 5)), app.MAX_QUEUE)
+
+    def test_mixes_come_from_home_selections_and_open_in_mix_order(self):
+        app = load_module()
+        selections = json.dumps({"collection": [
+            {"kind": "selection", "urn": "soundcloud:selections:buzzing", "title": "Artists to watch",
+             "items": {"collection": [{"kind": "playlist", "id": 900, "title": "Buzzing",
+                                       "track_count": 12, "permalink_url": "https://soundcloud.com/x/sets/b",
+                                       "user": {}}]}},
+            {"kind": "selection", "urn": "soundcloud:selections:your-moods", "title": "Mixed for you",
+             "items": {"collection": [
+                 {"kind": "system-playlist", "urn": "soundcloud:system-playlists:your-moods:1:1",
+                  "title": "Your Mix 1", "permalink_url": "https://soundcloud.com/discover/sets/m1",
+                  "tracks": [{"id": 3}, {"id": 2}]},
+                 {"kind": "system-playlist", "urn": "soundcloud:system-playlists:your-moods:1:1",
+                  "title": "Your Mix 1 again", "tracks": [{"id": 3}]},
+                 {"kind": "system-playlist", "urn": "soundcloud:system-playlists:empty", "title": "Empty",
+                  "tracks": []},
+             ]}},
+        ]})
+        stubs = json.dumps([self.api_track(2, "Second"), self.api_track(3, "Third")])
+        harness = self.PRELUDE + f"""
+global.document = {{ querySelector() {{ return null; }}, querySelectorAll() {{ return []; }} }};
+window.fetch = async function(input) {{
+  const url = typeof input === 'string' ? input : input.url;
+  calls.push(url);
+  let payload = {{ collection: [] }};
+  if (url.includes('/mixed-selections')) payload = {selections};
+  else if (url.includes('/tracks?')) payload = {stubs};
+  return new Response(JSON.stringify(payload), {{ status: 200 }});
+}};
+eval({json.dumps(app.api_request_capture_script())});
+(async () => {{
+  const before = JSON.parse(await window.__omarchyMixes());
+  await window.fetch(new Request('https://api-v2.soundcloud.com/mixed-selections?client_id=public-test',
+    {{ headers: {{ authorization: 'OAuth private-test-value' }} }}));
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  const mixes = JSON.parse(await window.__omarchyMixes());
+  const opened = JSON.parse(await window.__omarchyOpenCollection('mix', 1));
+  const missing = JSON.parse(await window.__omarchyOpenCollection('mix', 9));
+  process.stdout.write(JSON.stringify({{ before, mixes, opened, missing }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+        completed, result = self.run_node(harness)
+
+        self.assertTrue(result["before"]["needsHome"])
+        rows = result["mixes"]["collections"]
+        # Your mixes rank before other selections; duplicates and empty mixes are dropped.
+        self.assertEqual([(row["kind"], row["title"]) for row in rows],
+                         [("mix", "Your Mix 1"), ("playlist", "Buzzing")])
+        self.assertEqual(rows[0]["subtitle"], "Mixed for you  •  2 tracks")
+        self.assertIsNotNone(app.validate_collections_payload(result["mixes"]))
+        self.assertEqual([t["title"] for t in result["opened"]["tracks"]], ["Third", "Second"])
+        self.assertIn("error", result["missing"])
+        self.assertNotIn("private-test-value", completed.stdout)
+
+    def test_widget_has_mixes_tab_and_shuffle_button(self):
+        source = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        self.assertIn('onClicked: root.selectTab("mixes")', source)
+        self.assertIn('sendCommand("mixes", "mixes")', source)
+        self.assertIn('sendCommand("shuffle:" + listSource(), "action")', source)
+        self.assertIn("onClicked: root.shuffleCurrentList()", source)
+        self.assertIn('openedCollection.tab', source)
+
+    def test_opened_collection_reply_is_matched_by_collection_id(self):
+        # Replies carry the request number in "id", so the collection travels as collectionId.
+        source = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        backend = MODULE_PATH.read_text()
+        self.assertIn("Number(message.collectionId) !== openedCollection.id", source)
+        self.assertNotIn("Number(message.id) !== openedCollection.id", source)
+        self.assertIn('{"kind": kind, "collectionId": identifier}', backend)
+
+
+class RelatedAutoplayTest(unittest.TestCase):
+    PRELUDE = SearchAndPlayerHandoffTest.HARNESS_PRELUDE
+    api_track = staticmethod(QueueLibraryAndMprisTest.api_track)
+
+    @staticmethod
+    def track(number):
+        return {"playbackId": f"soundcloud:tracks:{number}", "title": f"T{number}"}
+
+    def test_extend_queue_skips_known_tracks_and_stays_bounded(self):
+        app = load_module()
+        queue = [self.track(n) for n in range(1, 4)]
+        extended, index = app.extend_queue(queue, 2, [self.track(3), self.track(4), {"playbackId": "x"}])
+        self.assertEqual([t["playbackId"] for t in extended][-2:], ["soundcloud:tracks:3", "soundcloud:tracks:4"])
+        self.assertEqual(index, 2)
+        full = [self.track(n) for n in range(1, app.MAX_QUEUE + 1)]
+        extended, index = app.extend_queue(full, app.MAX_QUEUE - 1, [self.track(n) for n in range(500, 520)])
+        self.assertEqual(len(extended), app.MAX_QUEUE)
+        self.assertEqual(extended[index]["playbackId"], f"soundcloud:tracks:{app.MAX_QUEUE}")
+        self.assertEqual(extended[index + 1]["playbackId"], "soundcloud:tracks:500")
+
+    def test_related_tracks_come_from_the_tracks_related_endpoint(self):
+        app = load_module()
+        related = json.dumps({"collection": [self.api_track(11, "Near"), self.api_track(12, "Nearer")]})
+        harness = self.PRELUDE + f"""
+global.document = {{ querySelector() {{ return null; }}, querySelectorAll() {{ return []; }} }};
+window.fetch = async function(input) {{
+  const url = typeof input === 'string' ? input : input.url;
+  calls.push(url);
+  const payload = url.includes('/tracks/10/related') ? {related} : {{ collection: [] }};
+  return new Response(JSON.stringify(payload), {{ status: 200 }});
+}};
+eval({json.dumps(app.api_request_capture_script())});
+(async () => {{
+  await window.fetch(new Request('https://api-v2.soundcloud.com/me?client_id=public-test',
+    {{ headers: {{ authorization: 'OAuth private-test-value' }} }}));
+  const found = JSON.parse(await window.__omarchyRelated(10));
+  const refused = JSON.parse(await window.__omarchyRelated('nope'));
+  process.stdout.write(JSON.stringify({{ found, refused }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+        completed = subprocess.run(["node", "-e", harness], check=True, capture_output=True, text=True)
+        result = json.loads(completed.stdout)
+        self.assertEqual([t["title"] for t in result["found"]["tracks"]], ["Near", "Nearer"])
+        self.assertIn("error", result["refused"])
+        self.assertNotIn("private-test-value", completed.stdout)
+        self.assertIsNotNone(app.validate_tracks_payload(result["found"]))

@@ -67,6 +67,17 @@ ARTWORK_HOSTS = {"i1.sndcdn.com"}
 MAX_WAVEFORM_BARS = 200
 # SoundCloud's bot protection (DataDome) shows its captcha in an iframe from here.
 BOT_CHECK_HOSTS = {"geo.captcha-delivery.com"}
+# "Continue with Google/Apple/Facebook" opens a popup on these providers.
+# Only sign-in popups may navigate here; the main view stays on SoundCloud.
+SIGN_IN_PROVIDER_HOSTS = {
+    "accounts.google.com",
+    "accounts.youtube.com",
+    "appleid.apple.com",
+    "idmsa.apple.com",
+    "www.facebook.com",
+    "m.facebook.com",
+    "facebook.com",
+}
 SOUNDCLOUD_WEB_HOSTS = {
     "soundcloud.com",
     "www.soundcloud.com",
@@ -603,6 +614,25 @@ def is_bot_check_uri(uri: str) -> bool:
     )
 
 
+def is_sign_in_provider_uri(uri: str) -> bool:
+    try:
+        parsed = urlparse(uri)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+    ):
+        return False
+    host = parsed.hostname.lower().rstrip(".")
+    # Google bounces through its country domains to set cookies.
+    return host in SIGN_IN_PROVIDER_HOSTS or re.fullmatch(r"accounts\.google(\.com?)?\.[a-z]{2,3}", host) is not None
+
+
 def is_playback_id(value: object) -> bool:
     return isinstance(value, str) and re.fullmatch(r"soundcloud:tracks:[1-9][0-9]*", value) is not None
 
@@ -625,13 +655,15 @@ def is_allowed_artwork_uri(uri: str) -> bool:
     )
 
 
-def normalize_list_artwork_url(uri: object) -> str:
+def normalize_list_artwork_url(uri: object, size: str = "t120x120") -> str:
     if not isinstance(uri, str) or not is_allowed_artwork_uri(uri):
+        return ""
+    if not re.fullmatch(r"t\d{2,3}x\d{2,3}", size):
         return ""
     parsed = urlparse(uri)
     path = re.sub(
         r"-(?:large|original|t\d+x\d+)(\.(?:jpe?g|png))$",
-        r"-t120x120\1",
+        rf"-{size}\1",
         parsed.path,
         flags=re.IGNORECASE,
     )
@@ -762,6 +794,17 @@ def api_request_capture_script() -> str:
       const playbackTracks = new Map();
       let playbackGeneration = 0;
       let latestRequestContext = null;
+      // Any authenticated api-v2 request the frontend makes; search only needs
+      // its client id and authorization, not a Home/Feed route.
+      let latestApiContext = null;
+      const isApiV2 = (input) => {
+        try {
+          const request = input instanceof Request ? input : null;
+          const url = new URL(request ? request.url : input, location.href);
+          return url.protocol === 'https:' && url.hostname === 'api-v2.soundcloud.com'
+            && (!url.port || url.port === '443') && !url.username && !url.password;
+        } catch (_) { return false; }
+      };
       const routeGenerations = Object.create(null);
       const nextRouteGeneration = (path) => {
         const source = path === '/stream' ? 'feed' : 'home';
@@ -984,10 +1027,21 @@ def api_request_capture_script() -> str:
           error: String(error || 'Could not load more tracks').slice(0, 128)
         }));
       };
+      // Home's selections (your mixes, stations, playlists) for the Mixes tab.
+      let homeSelections = [];
+      const rememberSelections = (payload) => {
+        const list = payload && Array.isArray(payload.collection) ? payload.collection.slice(0, 50) : [];
+        const known = new Set(homeSelections.map((selection) => selection && selection.urn));
+        homeSelections = homeSelections
+          .concat(list.filter((selection) => selection && typeof selection === 'object' && !known.has(selection.urn)))
+          .slice(0, 50);
+      };
+      window.__omarchyHomeSelections = () => homeSelections;
       const publish = async (path, text, context, routeGeneration) => {
         try {
           if (!(text.length > 0 && text.length <= 2 * 1024 * 1024)) throw new Error('invalid response');
           const payload = JSON.parse(text);
+          if (path === '/mixed-selections') rememberSelections(payload);
           const stagedPlayback = new Map();
           const tracks = path === '/mixed-selections'
             ? await homeTracks(payload, context, stagedPlayback)
@@ -1111,12 +1165,12 @@ def api_request_capture_script() -> str:
           let item = playbackTracks.get(target);
           if (item) return item;
           const waitDeadline = Date.now() + 30000;
-          while (!latestRequestContext && Date.now() < waitDeadline) {
+          while (!latestRequestContext && !latestApiContext && Date.now() < waitDeadline) {
             if (generation !== playbackGeneration) throw new Error('selection superseded');
             await new Promise((resolve) => setTimeout(resolve, 25));
           }
           const id = target.substring('soundcloud:tracks:'.length);
-          const context = latestRequestContext;
+          const context = latestRequestContext || latestApiContext;
           if (!context) throw new Error('track context unavailable');
           const request = new URL(context.requestUrl);
           if (request.protocol !== 'https:' || request.hostname !== 'api-v2.soundcloud.com'
@@ -1212,6 +1266,11 @@ def api_request_capture_script() -> str:
         const context = path ? requestContext(input, init) : null;
         const routeGeneration = path ? nextRouteGeneration(path) : 0;
         if (context) latestRequestContext = context;
+        else if (isApiV2(input)) {
+          const apiContext = requestContext(input, init);
+          if (apiContext.headers.has('authorization') || new URL(apiContext.requestUrl).searchParams.has('client_id'))
+            latestApiContext = apiContext;
+        }
         markLoading(path);
         return originalFetch(input, init).then((response) => {
           if (path && response.ok) {
@@ -1244,15 +1303,16 @@ def api_request_capture_script() -> str:
         const path = routeFor(url);
         xhrRequests.set(this, {
           path,
+          api: !path && isApiV2(url),
           headers: new Headers(),
           credentials: 'include',
-          requestUrl: path ? new URL(url, location.href).href : ''
+          requestUrl: (path || isApiV2(url)) ? new URL(url, location.href).href : ''
         });
         return originalOpen.apply(this, arguments);
       };
       XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
         const context = xhrRequests.get(this);
-        if (context && context.path
+        if (context && (context.path || context.api)
             && /^(authorization|x-client-id|x-soundcloud-client-id)$/i.test(String(name))) {
           const bounded = String(value);
           if (bounded.length <= 2048) context.headers.set(String(name), bounded);
@@ -1264,6 +1324,7 @@ def api_request_capture_script() -> str:
         const path = context.path;
         const routeGeneration = path ? nextRouteGeneration(path) : 0;
         if (path) latestRequestContext = context;
+        else if (context.api) latestApiContext = context;
         markLoading(path);
         if (path) this.addEventListener('load', function() {
           if (this.status >= 200 && this.status < 300
@@ -1321,6 +1382,288 @@ def api_request_capture_script() -> str:
         ));
         return { started: true, hasMore: true };
       };
+      // Track SoundCloud's own web player so the backend can keep only one
+      // player audible and pause the page when its window closes.
+      const pageMedia = new Set();
+      if (typeof HTMLMediaElement !== 'undefined' && HTMLMediaElement.prototype
+          && typeof HTMLMediaElement.prototype.play === 'function') {
+        const originalPlay = HTMLMediaElement.prototype.play;
+        HTMLMediaElement.prototype.play = function() {
+          try {
+            if (pageMedia.size >= 16 && !pageMedia.has(this)) pageMedia.clear();
+            pageMedia.add(this);
+            if (typeof window.__omarchyVolume === 'number') this.volume = window.__omarchyVolume;
+            window.webkit.messageHandlers.omarchyPlayback.postMessage(
+              JSON.stringify({ event: 'page-play' }));
+          } catch (_) {}
+          return originalPlay.apply(this, arguments);
+        };
+      }
+      const pageMediaElements = () => {
+        const media = new Set(pageMedia);
+        try {
+          for (const node of document.querySelectorAll('audio, video')) media.add(node);
+        } catch (_) {}
+        return media;
+      };
+      window.__omarchyPagePlaying = function() {
+        for (const item of pageMediaElements()) {
+          try { if (!item.paused && !item.ended) return true; } catch (_) {}
+        }
+        return false;
+      };
+      // SoundCloud plays through media elements it never attaches to the DOM.
+      window.__omarchyPageMediaState = function() {
+        let chosen = null;
+        for (const item of pageMediaElements()) {
+          try {
+            if (!item.paused && !item.ended) { chosen = item; break; }
+            chosen = item;
+          } catch (_) {}
+        }
+        if (!chosen) return { present: false, playing: false, duration: 0, position: 0 };
+        const duration = Number(chosen.duration);
+        const position = Number(chosen.currentTime);
+        return {
+          present: true,
+          playing: !chosen.paused && !chosen.ended,
+          duration: Number.isFinite(duration) && duration > 0 ? duration : 0,
+          position: Number.isFinite(position) && position > 0 ? position : 0
+        };
+      };
+      window.__omarchyPausePage = function() {
+        if (!window.__omarchyPagePlaying()) return false;
+        try {
+          const control = document.querySelector('.playControls__play.playing, .playControl.playing');
+          if (control) control.click();
+        } catch (_) {}
+        for (const item of pageMediaElements()) {
+          try { if (!item.paused) item.pause(); } catch (_) {}
+        }
+        return true;
+      };
+      window.__omarchySetVolume = function(value) {
+        const volume = Math.max(0, Math.min(1, Number(value)));
+        if (!Number.isFinite(volume)) return false;
+        window.__omarchyVolume = volume;
+        for (const item of pageMediaElements()) {
+          try { item.volume = volume; } catch (_) {}
+        }
+        return true;
+      };
+      const apiGet = async (pathname, params) => {
+        const context = latestRequestContext || latestApiContext;
+        if (!context || !(context.headers instanceof Headers))
+          throw new Error('SoundCloud is still loading, try again in a moment');
+        const request = new URL(context.requestUrl);
+        if (request.protocol !== 'https:' || request.hostname !== 'api-v2.soundcloud.com'
+            || request.port || request.username || request.password)
+          throw new Error('SoundCloud is unavailable');
+        const clientId = request.searchParams.get('client_id');
+        request.pathname = pathname;
+        request.search = '';
+        for (const [name, value] of Object.entries(params || {})) request.searchParams.set(name, String(value));
+        if (clientId) request.searchParams.set('client_id', clientId);
+        const response = await originalFetch(request.href, {
+          method: 'GET', headers: context.headers, credentials: context.credentials,
+          cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer'
+        });
+        if (!response.ok) throw new Error('SoundCloud request failed (HTTP ' + response.status + ')');
+        const text = await boundedText(response, 2 * 1024 * 1024);
+        if (!text.length) throw new Error('SoundCloud returned nothing');
+        return { payload: JSON.parse(text), context };
+      };
+      const failure = (error) => {
+        const message = String(error && error.message || '');
+        return /^SoundCloud /.test(message) ? message.slice(0, 128) : 'SoundCloud request failed';
+      };
+      // normalise() walks a bounded number of objects; scan each result on its
+      // own so long responses are not cut short.
+      const normaliseEach = (payload, context) => {
+        const items = Array.isArray(payload) ? payload
+          : (payload && Array.isArray(payload.collection) ? payload.collection : [payload]);
+        const tracks = [];
+        const seen = new Set();
+        for (const item of items.slice(0, 100)) {
+          for (const track of normalise(item, context)) {
+            if (seen.has(track.url)) continue;
+            seen.add(track.url);
+            tracks.push(track);
+          }
+          if (tracks.length >= 50) break;
+        }
+        return tracks.slice(0, 50);
+      };
+      // Follow SoundCloud's next_href (same api-v2 path only) until 50 tracks.
+      const pagedTracks = async (pathname, params, limit = 50) => {
+        let { payload, context } = await apiGet(pathname, params);
+        let tracks = normaliseEach(payload, context);
+        for (let page = 1; page < 8 && tracks.length < limit; page++) {
+          const next = validNextUrl(payload, pathname);
+          if (!next) break;
+          const url = new URL(next);
+          const nextParams = {};
+          for (const [name, value] of url.searchParams) if (name !== 'client_id') nextParams[name] = value;
+          ({ payload, context } = await apiGet(pathname, nextParams));
+          const known = new Set(tracks.map((track) => track.url));
+          tracks = tracks.concat(normaliseEach(payload, context).filter((track) => !known.has(track.url)));
+        }
+        return tracks.slice(0, limit);
+      };
+      // Track stubs ({id}) to full tracks, kept in the given order.
+      const tracksForIds = async (ids, known = []) => {
+        let tracks = known;
+        const have = new Set(tracks.map((track) => track.playbackId));
+        const missing = ids.filter((trackId) => !have.has('soundcloud:tracks:' + trackId));
+        for (let index = 0; index < missing.length && index < 100; index += 50) {
+          const page = await apiGet('/tracks', { ids: missing.slice(index, index + 50).join(',') });
+          tracks = tracks.concat(normaliseEach(page.payload, page.context));
+        }
+        return tracksInOrder(ids, tracks).slice(0, 100);
+      };
+      // Mixes come from Home's selections; a mix is opened by its row number.
+      const mixTrackIds = new Map();
+      const selectionRank = (selection) => {
+        const urn = String(selection && selection.urn || '');
+        const order = ['your-moods', 'personalized-tracks', 'artist-stations', 'recently-played'];
+        const rank = order.findIndex((name) => urn.includes(':' + name));
+        return rank < 0 ? order.length : rank;
+      };
+      window.__omarchyMixes = async function() {
+        if (!homeSelections.length) return JSON.stringify({ collections: [], needsHome: true });
+        mixTrackIds.clear();
+        const collections = [];
+        const seen = new Set();
+        const selections = homeSelections.slice().sort((a, b) => selectionRank(a) - selectionRank(b));
+        for (const selection of selections) {
+          const itemState = selection.items && typeof selection.items === 'object' ? selection.items : null;
+          const items = Array.isArray(itemState) ? itemState
+            : (itemState && Array.isArray(itemState.collection) ? itemState.collection : []);
+          const group = String(selection.title || '').slice(0, 128);
+          for (const item of items.slice(0, 30)) {
+            if (!item || typeof item !== 'object' || collections.length >= 50) continue;
+            const key = String(item.urn || item.id || '');
+            if (!key || seen.has(key)) continue;
+            const user = item.user && typeof item.user === 'object' ? item.user : {};
+            const art = String(item.calculated_artwork_url || item.artwork_url || user.avatar_url || '').slice(0, 2048);
+            const link = typeof item.permalink_url === 'string' && /^https:\/\/soundcloud\.com\//.test(item.permalink_url)
+              ? item.permalink_url.slice(0, 2048) : 'https://soundcloud.com/discover';
+            if (item.kind === 'system-playlist' && Array.isArray(item.tracks)) {
+              const ids = item.tracks.slice(0, 100).map((entry) => positiveId(entry && entry.id)).filter(Boolean);
+              if (!ids.length) continue;
+              seen.add(key);
+              mixTrackIds.set(collections.length + 1, ids);
+              collections.push({
+                kind: 'mix', id: collections.length + 1,
+                title: String(item.title || item.short_title || 'Mix').slice(0, 512),
+                subtitle: [group, ids.length + ' tracks'].filter(Boolean).join('  •  ').slice(0, 256),
+                artUrl: art, url: link
+              });
+            } else if (item.kind === 'playlist' && positiveId(item.id)) {
+              seen.add(key);
+              const count = positiveId(item.track_count);
+              collections.push({
+                kind: 'playlist', id: item.id,
+                title: String(item.title || '').slice(0, 512) || 'Playlist',
+                subtitle: [group, count ? count + ' tracks' : ''].filter(Boolean).join('  •  ').slice(0, 256),
+                artUrl: art, url: link
+              });
+            }
+          }
+        }
+        return JSON.stringify({ collections });
+      };
+      const positiveId = (value) => Number.isSafeInteger(value) && value > 0 ? value : 0;
+      const tracksInOrder = (ids, tracks) => {
+        const byUrn = new Map(tracks.filter((track) => track.playbackId).map((track) => [track.playbackId, track]));
+        const ordered = [];
+        for (const id of ids) {
+          const track = byUrn.get('soundcloud:tracks:' + id);
+          if (track) { ordered.push(track); byUrn.delete('soundcloud:tracks:' + id); }
+        }
+        return ordered.concat(Array.from(byUrn.values()));
+      };
+      window.__omarchySearch = async function(value, kind) {
+        const query = String(value || '').trim().slice(0, 200);
+        const type = ['tracks', 'playlists', 'users'].includes(kind) ? kind : 'tracks';
+        if (!query) return JSON.stringify({ tracks: [], collections: [] });
+        try {
+          const { payload, context } = await apiGet('/search/' + type, { q: query, limit: 40 });
+          if (type === 'tracks')
+            return JSON.stringify({ tracks: normaliseEach(payload, context) });
+          const items = payload && Array.isArray(payload.collection) ? payload.collection.slice(0, 40) : [];
+          const collections = [];
+          for (const item of items) {
+            if (!item || typeof item !== 'object' || !positiveId(item.id)) continue;
+            const user = item.user && typeof item.user === 'object' ? item.user : {};
+            if (type === 'playlists' && (item.kind === 'playlist' || item.kind === undefined)) {
+              const count = positiveId(item.track_count);
+              collections.push({
+                kind: 'playlist', id: item.id,
+                title: String(item.title || '').slice(0, 512),
+                subtitle: [String(user.username || ''), count ? count + ' tracks' : ''].filter(Boolean).join('  •  ').slice(0, 256),
+                artUrl: String(item.artwork_url || user.avatar_url || '').slice(0, 2048),
+                url: String(item.permalink_url || '').slice(0, 2048)
+              });
+            } else if (type === 'users' && (item.kind === 'user' || item.kind === undefined)) {
+              const count = positiveId(item.track_count);
+              collections.push({
+                kind: 'user', id: item.id,
+                title: String(item.username || item.full_name || '').slice(0, 512),
+                subtitle: (count ? count + ' tracks' : 'Artist').slice(0, 256),
+                artUrl: String(item.avatar_url || '').slice(0, 2048),
+                url: String(item.permalink_url || '').slice(0, 2048)
+              });
+            }
+          }
+          return JSON.stringify({ collections });
+        } catch (error) {
+          return JSON.stringify({ tracks: [], collections: [], error: failure(error) });
+        }
+      };
+      window.__omarchyOpenCollection = async function(kind, value) {
+        const id = positiveId(Number(value));
+        if (!id || !['playlist', 'user', 'mix'].includes(kind))
+          return JSON.stringify({ tracks: [], error: 'SoundCloud could not open this' });
+        try {
+          if (kind === 'mix') {
+            const ids = mixTrackIds.get(id);
+            if (!ids) throw new Error('SoundCloud mixes changed, open Mixes again');
+            return JSON.stringify({ tracks: await tracksForIds(ids) });
+          }
+          if (kind === 'user') {
+            return JSON.stringify({ tracks: await pagedTracks('/users/' + id + '/tracks', { limit: 50 }) });
+          }
+          const { payload, context } = await apiGet('/playlists/' + id, {});
+          const entries = payload && Array.isArray(payload.tracks) ? payload.tracks.slice(0, 100) : [];
+          const ids = entries.map((entry) => positiveId(entry && entry.id)).filter(Boolean);
+          const embedded = normaliseEach({ collection: entries.filter((entry) => entry && entry.title) }, context);
+          return JSON.stringify({ tracks: await tracksForIds(ids, embedded) });
+        } catch (error) {
+          return JSON.stringify({ tracks: [], error: failure(error) });
+        }
+      };
+      // Tracks SoundCloud relates to one track, for autoplay after a list ends.
+      window.__omarchyRelated = async function(value) {
+        const id = positiveId(Number(value));
+        if (!id) return JSON.stringify({ tracks: [], error: 'SoundCloud could not find related tracks' });
+        try {
+          const { payload, context } = await apiGet('/tracks/' + id + '/related', { limit: 20 });
+          return JSON.stringify({ tracks: normaliseEach(payload, context).slice(0, 20) });
+        } catch (error) {
+          return JSON.stringify({ tracks: [], error: failure(error) });
+        }
+      };
+      window.__omarchyLikes = async function() {
+        try {
+          const me = await apiGet('/me', {});
+          const userId = positiveId(me.payload && me.payload.id);
+          if (!userId) throw new Error('SoundCloud did not return your account');
+          return JSON.stringify({ tracks: await pagedTracks('/users/' + userId + '/track_likes', { limit: 50 }, 100) });
+        } catch (error) {
+          return JSON.stringify({ tracks: [], error: failure(error) });
+        }
+      };
     })()"""
 
 
@@ -1371,7 +1714,9 @@ def play_track_script(playback_id: str, request_id: int) -> str | None:
 def status_script() -> str:
     return r"""(() => {
       const audio = document.querySelector('audio');
-      const playerPresent = !!audio;
+      const hooked = typeof window.__omarchyPageMediaState === 'function'
+        ? window.__omarchyPageMediaState() : { present: false, playing: false, duration: 0, position: 0 };
+      const playerPresent = !!audio || hooked.present === true;
       const playControl = document.querySelector('.playControls__play, .playControl');
       const controlSaysPause = !!playControl && (
         playControl.classList.contains('playing') ||
@@ -1412,9 +1757,11 @@ def status_script() -> str:
         const match = background.match(/url\(["']?(.*?)["']?\)/);
         if (match) { artUrl = match[1].slice(0, 2048); break; }
       }
+      const pagePlaying = (!!audio && !audio.paused) || hooked.playing === true;
       return {
         playerPresent,
-        playing: playerPresent ? !audio.paused : false,
+        pagePlaying,
+        playing: playerPresent ? pagePlaying : false,
         title: playerPresent
           ? text('.playbackSoundBadge__titleLink span[aria-hidden="true"]', '.playbackSoundBadge__titleLink') : '',
         artist: playerPresent
@@ -1423,8 +1770,10 @@ def status_script() -> str:
         loggedIn: !/^\/(signin|register)/.test(location.pathname) &&
           !!document.querySelector('.header__userNavButton, a[href*="/you/library"]'),
         url: location.href,
-        duration: playerPresent && isFinite(audio.duration) ? audio.duration : 0,
-        position: playerPresent && isFinite(audio.currentTime) ? audio.currentTime : 0
+        duration: audio && isFinite(audio.duration) ? audio.duration
+          : (playerPresent ? (hooked.duration || timelineDuration) : 0),
+        position: audio && isFinite(audio.currentTime) ? audio.currentTime
+          : (playerPresent ? (hooked.position || timelinePosition) : 0)
       };
     })()"""
 
@@ -1882,8 +2231,180 @@ def command_script(action: str) -> str | None:
           const button = document.querySelector('.skipControl__previous, button[title="Previous"], button[aria-label="Previous"]');
           if (!button) return false; button.click(); return true;
         })()""",
+        "pause-page": r"""(() => {
+          if (typeof window.__omarchyPausePage === 'function') window.__omarchyPausePage();
+          return true;
+        })()""",
     }
     return scripts.get(action)
+
+
+# These run through call_async_javascript_function, which awaits the promise.
+PAGE_FUNCTION_MISSING = "return JSON.stringify({ tracks: [], collections: [], error: 'SoundCloud is still loading' });"
+SEARCH_TRACKS_FUNCTION = f"""
+if (typeof window.__omarchySearch !== 'function') {PAGE_FUNCTION_MISSING}
+return await window.__omarchySearch(query, kind);
+"""
+OPEN_COLLECTION_FUNCTION = f"""
+if (typeof window.__omarchyOpenCollection !== 'function') {PAGE_FUNCTION_MISSING}
+return await window.__omarchyOpenCollection(kind, id);
+"""
+RELATED_TRACKS_FUNCTION = f"""
+if (typeof window.__omarchyRelated !== 'function') {PAGE_FUNCTION_MISSING}
+return await window.__omarchyRelated(id);
+"""
+MIXES_FUNCTION = f"""
+if (typeof window.__omarchyMixes !== 'function') {PAGE_FUNCTION_MISSING}
+return await window.__omarchyMixes();
+"""
+LIKED_TRACKS_FUNCTION = f"""
+if (typeof window.__omarchyLikes !== 'function') {PAGE_FUNCTION_MISSING}
+return await window.__omarchyLikes();
+"""
+MAX_SEARCH_QUERY_BYTES = 200
+SEARCH_KINDS = {"search": "tracks", "search-playlists": "playlists", "search-users": "users"}
+# Lists a track can be played from; each becomes the queue for next/previous.
+QUEUE_SOURCES = ("home", "feed", "likes", "search", "collection")
+MAX_QUEUE = 100
+PLAYER_STATE_BYTES = 256 * 1024
+
+
+def search_from_command(command: str) -> tuple[str, str] | None:
+    """Return (kind, query) for search:, search-playlists:, and search-users:."""
+    prefix, separator, query = command.partition(":")
+    if not separator or prefix not in SEARCH_KINDS:
+        return None
+    query = query.strip()
+    if (not query or len(query.encode("utf-8")) > MAX_SEARCH_QUERY_BYTES
+            or any(ord(character) < 32 or ord(character) == 127 for character in query)):
+        return None
+    return SEARCH_KINDS[prefix], query
+
+
+def search_query_from_command(command: str) -> str | None:
+    found = search_from_command(command)
+    return found[1] if found and command.startswith("search:") else None
+
+
+def collection_from_command(command: str) -> tuple[str, int] | None:
+    match = re.fullmatch(r"open:(playlist|user|mix):([1-9][0-9]{0,15})", command)
+    return (match.group(1), int(match.group(2))) if match else None
+
+
+def extend_queue(queue: list[dict[str, object]], index: int,
+                 extra: list[dict[str, object]]) -> tuple[list[dict[str, object]], int]:
+    """Append unseen playable tracks, dropping played ones so the queue stays bounded."""
+    known = {track.get("playbackId") for track in queue}
+    added = []
+    for track in extra:
+        playback_id = track.get("playbackId")
+        if is_playback_id(playback_id) and playback_id not in known:
+            known.add(playback_id)
+            added.append(track)
+    combined = list(queue) + added
+    overflow = max(0, len(combined) - MAX_QUEUE)
+    overflow = min(overflow, max(0, index))
+    return combined[overflow:][:MAX_QUEUE], index - overflow
+
+
+def shuffle_from_command(command: str) -> str | None:
+    """shuffle:<source> plays that list in a random order."""
+    source = command.removeprefix("shuffle:") if command.startswith("shuffle:") else ""
+    return source if source in QUEUE_SOURCES else None
+
+
+def shuffled_tracks(tracks: list[dict[str, object]], current: str = "") -> list[dict[str, object]]:
+    """Playable tracks in random order, never starting on the current track."""
+    playable = [track for track in tracks if is_playback_id(track.get("playbackId"))][:MAX_QUEUE]
+    secrets.SystemRandom().shuffle(playable)
+    if len(playable) > 1 and playable[0].get("playbackId") == current:
+        playable.append(playable.pop(0))
+    return playable
+
+
+def queued_play_from_command(command: str) -> tuple[str, str] | None:
+    """play-in:<source>:<playback id> plays a track and queues its list."""
+    match = re.fullmatch(r"play-in:([a-z]+):(soundcloud:tracks:[1-9][0-9]*)", command)
+    if not match or match.group(1) not in QUEUE_SOURCES:
+        return None
+    return match.group(1), match.group(2)
+
+
+def volume_from_command(command: str) -> float | None:
+    if not command.startswith("volume:"):
+        return None
+    try:
+        value = float(command.removeprefix("volume:"))
+    except ValueError:
+        return None
+    return max(0.0, min(1.0, value)) if math.isfinite(value) else None
+
+
+def volume_script(volume: float) -> str:
+    return rf"""(() => typeof window.__omarchySetVolume === 'function'
+      && window.__omarchySetVolume({max(0.0, min(1.0, float(volume)))!r}))()"""
+
+
+def queue_step(length: int, index: int, step: int) -> int | None:
+    """Index of the next or previous queued track, or None at either end."""
+    target = index + step
+    return target if 0 <= index < length and 0 <= target < length else None
+
+
+def validate_collections_payload(payload: object) -> list[dict[str, object]] | None:
+    items = payload.get("collections") if isinstance(payload, dict) else None
+    if not isinstance(items, list) or len(items) > 50:
+        return None
+    collections = []
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        kind = item.get("kind")
+        identifier = item.get("id")
+        title = _bounded_string(item.get("title", ""), MAX_TITLE_BYTES)
+        subtitle = _bounded_string(item.get("subtitle", ""), MAX_ARTIST_BYTES)
+        url = _bounded_string(item.get("url", ""), MAX_URL_BYTES)
+        art_url = _bounded_string(item.get("artUrl", ""), MAX_URL_BYTES)
+        if (kind not in {"playlist", "user", "mix"} or isinstance(identifier, bool)
+                or not isinstance(identifier, int) or not 0 < identifier < 10**16
+                or None in (title, subtitle, url, art_url) or not title
+                or not is_soundcloud_uri(url)):
+            return None
+        collections.append({
+            "kind": kind,
+            "id": identifier,
+            "title": title,
+            "subtitle": subtitle,
+            "url": url,
+            "artUrl": art_url if art_url and is_allowed_artwork_uri(art_url) else "",
+        })
+    return collections
+
+
+def sanitize_player_state(payload: object) -> dict[str, object]:
+    """The remembered volume, last track, and its queue, all re-validated."""
+    if not isinstance(payload, dict):
+        return {}
+    state: dict[str, object] = {}
+    volume = _finite_number(payload.get("volume"), 0, 1)
+    if volume is not None:
+        state["volume"] = volume
+    track_result = validate_tracks_payload({"tracks": [payload.get("track")]}) if payload.get("track") else None
+    if track_result and is_playback_id(track_result["tracks"][0].get("playbackId")):
+        state["track"] = track_result["tracks"][0]
+        state["position"] = _finite_number(payload.get("position", 0), 0, 60 * 60 * 24 * 7) or 0.0
+        queue_result = validate_tracks_payload({"tracks": payload.get("queue", [])})
+        queue = [
+            track for track in (queue_result["tracks"] if queue_result else [])
+            if is_playback_id(track.get("playbackId"))
+        ][:MAX_QUEUE]
+        source = payload.get("queueSource")
+        index = payload.get("queueIndex")
+        if (queue and source in QUEUE_SOURCES and isinstance(index, int)
+                and not isinstance(index, bool) and 0 <= index < len(queue)
+                and queue[index]["playbackId"] == state["track"]["playbackId"]):
+            state["queue"], state["queueSource"], state["queueIndex"] = queue, source, index
+    return state
 
 
 def seek_script(ratio: float) -> str:
@@ -2267,6 +2788,8 @@ class GstPlayback:
         self.metadata: dict[str, object] = {}
         self.error = ""
         self.generation = 0
+        self.volume = 1.0
+        self.ended = False
         self.bus_watches = {}
         self.hls_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=HLS_MAX_WORKERS,
@@ -2288,6 +2811,7 @@ class GstPlayback:
         elif message.type == self.Gst.MessageType.EOS:
             self.playing = False
             self.state = "paused"
+            self.ended = True
             self.on_change()
         elif message.type == self.Gst.MessageType.STATE_CHANGED and message.src == self.current:
             _old, current, _pending = message.parse_state_changed()
@@ -2325,8 +2849,21 @@ class GstPlayback:
         self.state = "error" if self.error else "idle"
         self.on_change()
 
+    def set_volume(self, volume: float) -> bool:
+        self.volume = max(0.0, min(1.0, float(volume)))
+        if self.current is None:
+            return True
+        element = self.current.get_by_name("volume") if hasattr(self.current, "get_by_name") else None
+        target = element if element is not None else self.current
+        try:
+            target.set_property("volume", self.volume)
+        except (TypeError, ValueError):
+            return False
+        return True
+
     def begin(self, metadata: dict[str, object]) -> int:
         self._stop_current()
+        self.ended = False
         self.active = False
         self.playing = False
         self.has_started = False
@@ -2348,6 +2885,7 @@ class GstPlayback:
         self.active = True
         self.playing = False
         self.has_started = False
+        self.ended = False
         self.state = "buffering"
         if protocol == "hls" and mime_type == "audio/mpeg":
             return self._play_hls(uri)
@@ -2362,6 +2900,7 @@ class GstPlayback:
         self.current = pipeline
         self._watch_bus(pipeline, self.generation)
         pipeline.set_property("uri", uri)
+        pipeline.set_property("volume", self.volume)
         result = pipeline.set_state(self.Gst.State.PLAYING)
         if result == self.Gst.StateChangeReturn.FAILURE:
             self._stop_current()
@@ -2376,7 +2915,8 @@ class GstPlayback:
             pipeline = self.Gst.parse_launch(
                 "appsrc name=source format=time is-live=false block=true "
                 "caps=audio/mpeg,mpegversion=1,layer=3 ! mpegaudioparse ! "
-                "mpg123audiodec ! audioconvert ! audioresample ! autoaudiosink"
+                "mpg123audiodec ! audioconvert ! audioresample ! "
+                f"volume name=volume volume={self.volume!r} ! autoaudiosink"
             )
         except Exception:
             self.active = False
@@ -2456,6 +2996,11 @@ class GstPlayback:
             return False
         target = self.Gst.State.PAUSED if self.playing else self.Gst.State.PLAYING
         return self.current.set_state(target) != self.Gst.StateChangeReturn.FAILURE
+
+    def pause(self) -> bool:
+        if not self.active or self.current is None:
+            return False
+        return self.current.set_state(self.Gst.State.PAUSED) != self.Gst.StateChangeReturn.FAILURE
 
     def seek(self, ratio: float) -> bool:
         if not self.active:
@@ -2756,6 +3301,107 @@ class ControlServer(threading.Thread):
         self._unlink_owned_socket()
 
 
+MPRIS_BUS_NAME = "org.mpris.MediaPlayer2.omarchy_soundcloud"
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+MPRIS_ROOT = "org.mpris.MediaPlayer2"
+MPRIS_PLAYER = "org.mpris.MediaPlayer2.Player"
+MPRIS_XML = """<node>
+  <interface name="org.mpris.MediaPlayer2">
+    <method name="Raise"/>
+    <method name="Quit"/>
+    <property name="CanQuit" type="b" access="read"/>
+    <property name="CanRaise" type="b" access="read"/>
+    <property name="HasTrackList" type="b" access="read"/>
+    <property name="Identity" type="s" access="read"/>
+    <property name="DesktopEntry" type="s" access="read"/>
+    <property name="SupportedUriSchemes" type="as" access="read"/>
+    <property name="SupportedMimeTypes" type="as" access="read"/>
+  </interface>
+  <interface name="org.mpris.MediaPlayer2.Player">
+    <method name="Next"/>
+    <method name="Previous"/>
+    <method name="Pause"/>
+    <method name="PlayPause"/>
+    <method name="Stop"/>
+    <method name="Play"/>
+    <method name="Seek"><arg direction="in" name="Offset" type="x"/></method>
+    <method name="SetPosition">
+      <arg direction="in" name="TrackId" type="o"/>
+      <arg direction="in" name="Position" type="x"/>
+    </method>
+    <method name="OpenUri"><arg direction="in" name="Uri" type="s"/></method>
+    <signal name="Seeked"><arg name="Position" type="x"/></signal>
+    <property name="PlaybackStatus" type="s" access="read"/>
+    <property name="Rate" type="d" access="readwrite"/>
+    <property name="Metadata" type="a{sv}" access="read"/>
+    <property name="Volume" type="d" access="readwrite"/>
+    <property name="Position" type="x" access="read"/>
+    <property name="MinimumRate" type="d" access="read"/>
+    <property name="MaximumRate" type="d" access="read"/>
+    <property name="CanGoNext" type="b" access="read"/>
+    <property name="CanGoPrevious" type="b" access="read"/>
+    <property name="CanPlay" type="b" access="read"/>
+    <property name="CanPause" type="b" access="read"/>
+    <property name="CanSeek" type="b" access="read"/>
+    <property name="CanControl" type="b" access="read"/>
+  </interface>
+</node>"""
+MPRIS_ROOT_PROPERTIES = {
+    "CanQuit": ("b", False),
+    "CanRaise": ("b", True),
+    "HasTrackList": ("b", False),
+    "Identity": ("s", APP_NAME),
+    "DesktopEntry": ("s", APP_ID),
+    "SupportedUriSchemes": ("as", []),
+    "SupportedMimeTypes": ("as", []),
+}
+
+
+def mpris_player_properties(state: dict[str, object], art_url: str, volume: float) -> dict[str, tuple[str, object]]:
+    """MPRIS Player properties (signature, value) for a validated status."""
+    title = str(state.get("title") or "")
+    playing = state.get("playing") is True
+    duration = float(state.get("duration") or 0)
+    playback_id = str(state.get("playbackId") or "")
+    track_number = playback_id.rpartition(":")[2] if is_playback_id(playback_id) else "none"
+    metadata: dict[str, tuple[str, object]] = {
+        "mpris:trackid": ("o", f"{MPRIS_PATH}/track/{track_number}"),
+    }
+    if title:
+        metadata["xesam:title"] = ("s", title)
+        artist = str(state.get("artist") or "")
+        if artist:
+            metadata["xesam:artist"] = ("as", [artist])
+        if duration > 0:
+            metadata["mpris:length"] = ("x", int(duration * 1_000_000))
+        if art_url and is_allowed_artwork_uri(art_url):
+            metadata["mpris:artUrl"] = ("s", art_url)
+    return {
+        "PlaybackStatus": ("s", "Playing" if playing else ("Paused" if title else "Stopped")),
+        "Rate": ("d", 1.0),
+        "MinimumRate": ("d", 1.0),
+        "MaximumRate": ("d", 1.0),
+        "Metadata": ("a{sv}", metadata),
+        "Volume": ("d", float(volume)),
+        "CanGoNext": ("b", bool(title)),
+        "CanGoPrevious": ("b", bool(title)),
+        "CanPlay": ("b", True),
+        "CanPause": ("b", True),
+        "CanSeek": ("b", duration > 0),
+        "CanControl": ("b", True),
+    }
+
+
+class _NullConnection:
+    """Response sink for commands the backend issues to itself (MPRIS)."""
+
+    def send(self, _payload: object) -> bool:
+        return True
+
+    def close(self) -> None:
+        pass
+
+
 def build_application(show_on_start: bool = False):
     Gio, GLib, Gst, Gtk, Soup, WebKit2 = _load_gi()
     paths = profile_paths()
@@ -2767,6 +3413,99 @@ def build_application(show_on_start: bool = False):
         cookie_records = cookie_store.migrate_legacy_sqlite()
     track_cache_store = PrivateJsonStore(profile_fd, "tracks.json", MAX_TRACK_CACHE_BYTES)
     track_cache = sanitize_track_cache(track_cache_store.load())
+    player_state_store = PrivateJsonStore(profile_fd, "player.json", PLAYER_STATE_BYTES)
+    try:
+        saved_player_state = sanitize_player_state(player_state_store.load())
+    except OSError:
+        saved_player_state = {}
+
+    def variant(signature, value):
+        if signature == "a{sv}":
+            return GLib.Variant("a{sv}", {key: variant(*entry) for key, entry in value.items()})
+        return GLib.Variant(signature, value)
+
+    class MprisService:
+        """Exposes the player on D-Bus so media keys and the shell can drive it."""
+
+        def __init__(self, app):
+            self.app = app
+            self.connection = None
+            self.registrations = []
+            self.properties: dict[str, tuple[str, object]] = {}
+            self.position = 0.0
+            self.duration = 0.0
+            self.playing = False
+            self.node = Gio.DBusNodeInfo.new_for_xml(MPRIS_XML)
+            self.owner_id = Gio.bus_own_name(
+                Gio.BusType.SESSION, MPRIS_BUS_NAME, Gio.BusNameOwnerFlags.NONE,
+                self._acquired, None, None,
+            )
+
+        def _acquired(self, connection, _name):
+            self.connection = connection
+            for interface in self.node.interfaces:
+                self.registrations.append(connection.register_object(
+                    MPRIS_PATH, interface, self._method, self._get, self._set,
+                ))
+
+        def _get(self, _connection, _sender, _path, interface, name):
+            if interface == MPRIS_ROOT and name in MPRIS_ROOT_PROPERTIES:
+                return variant(*MPRIS_ROOT_PROPERTIES[name])
+            if name == "Position":
+                return GLib.Variant("x", int(self.position * 1_000_000))
+            entry = self.properties.get(name)
+            return variant(*entry) if entry else None
+
+        def _set(self, _connection, _sender, _path, interface, name, value):
+            if interface == MPRIS_PLAYER and name == "Volume":
+                self.app._run_internal(f"volume:{max(0.0, min(1.0, value.unpack())):.3f}")
+            return True
+
+        def _seek_to(self, seconds):
+            if self.duration > 0:
+                self.app._run_internal(f"seek:{max(0.0, min(1.0, seconds / self.duration)):.5f}")
+
+        def _method(self, _connection, _sender, _path, interface, method, parameters, invocation):
+            commands = {
+                "Raise": "show", "PlayPause": "play-pause", "Next": "next", "Previous": "previous",
+            }
+            if method in commands:
+                self.app._run_internal(commands[method])
+            elif method == "Play" and not self.playing:
+                self.app._run_internal("play-pause")
+            elif method in {"Pause", "Stop"} and self.playing:
+                self.app._run_internal("play-pause")
+            elif method == "Seek":
+                self._seek_to(self.position + parameters.unpack()[0] / 1_000_000)
+            elif method == "SetPosition":
+                self._seek_to(parameters.unpack()[1] / 1_000_000)
+            invocation.return_value(None)
+
+        def update(self, state, art_url, volume):
+            self.position = float(state.get("position") or 0)
+            self.duration = float(state.get("duration") or 0)
+            self.playing = state.get("playing") is True
+            properties = mpris_player_properties(state, art_url, volume)
+            changed = {
+                name: entry for name, entry in properties.items()
+                if self.properties.get(name) != entry
+            }
+            self.properties = properties
+            if changed and self.connection is not None:
+                self.connection.emit_signal(
+                    None, MPRIS_PATH, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                    GLib.Variant("(sa{sv}as)", (
+                        MPRIS_PLAYER,
+                        {name: variant(*entry) for name, entry in changed.items()},
+                        [],
+                    )),
+                )
+
+        def close(self):
+            if self.connection is not None:
+                for registration in self.registrations:
+                    self.connection.unregister_object(registration)
+            Gio.bus_unown_name(self.owner_id)
     socket_path = runtime_socket_path()
     prepare_runtime_socket_path(socket_path)
     install_path = Path(pwd.getpwuid(os.geteuid()).pw_dir) / ".config/omarchy/plugins/brunosilveira.soundcloud"
@@ -2784,7 +3523,7 @@ def build_application(show_on_start: bool = False):
             self.artwork_cache = ArtworkCache()
             self.playback = GstPlayback(
                 Gst,
-                lambda: GLib.idle_add(self._publish_status_once),
+                lambda: GLib.idle_add(self._playback_changed),
                 GLib.idle_add,
             )
             self.list_artwork_cache = ArtworkCache(
@@ -2810,6 +3549,34 @@ def build_application(show_on_start: bool = False):
                 if is_playback_id(track.get("playbackId"))
             }
             self.selection_generation = 0
+            # True while SoundCloud's own web player (inside the WebKit view) is audible.
+            self.page_playing = False
+            # True while the web player has a track loaded, playing or paused.
+            self.page_media_present = False
+            # Likes, search, and opened playlist/artist lists (Home/Feed live in track_cache).
+            self.lists: dict[str, list[dict[str, object]]] = {}
+            # The list the current track was played from; next/previous walk it.
+            self.queue: list[dict[str, object]] = []
+            self.queue_index = -1
+            self.queue_source = ""
+            # Home/Feed answered from cache instead of reloading the page.
+            self.cached_sources: set[str] = set()
+            self.pending_seek = 0.0
+            self.last_art_url = ""
+            self.last_state_save = 0.0
+            self.mpris = None
+            self.restored: dict[str, object] | None = None
+            self.playback.volume = float(saved_player_state.get("volume", 1.0))
+            if saved_player_state.get("track"):
+                track = saved_player_state["track"]
+                self.restored = {"track": track, "position": saved_player_state.get("position", 0.0)}
+                self.playback_tracks[track["playbackId"]] = track
+                if saved_player_state.get("queue"):
+                    self.queue = list(saved_player_state["queue"])
+                    self.queue_index = saved_player_state["queueIndex"]
+                    self.queue_source = saved_player_state["queueSource"]
+                    for queued in self.queue:
+                        self.playback_tracks.setdefault(queued["playbackId"], queued)
             self.track_cache_save_pending = False
             self.had_subscriber = False
             self.disconnect_generation = 0
@@ -2825,6 +3592,10 @@ def build_application(show_on_start: bool = False):
         def do_activate(self):
             self._create_window()
             self.hold()
+            try:
+                self.mpris = MprisService(self)
+            except Exception:
+                self.mpris = None
             self.control_server.start()
             GLib.timeout_add(750, self._publish_status)
             GLib.timeout_add_seconds(5, self._check_installation)
@@ -2835,6 +3606,9 @@ def build_application(show_on_start: bool = False):
                 GLib.idle_add(self.window.hide)
 
         def do_shutdown(self):
+            self._save_player_state()
+            if self.mpris is not None:
+                self.mpris.close()
             self.control_server.close()
             self.playback.close()
             self.artwork_cache.close()
@@ -2892,6 +3666,7 @@ def build_application(show_on_start: bool = False):
                 ("media-playback-requires-user-gesture", False),
             ):
                 settings.set_property(name, value)
+            self.webview.connect("load-changed", self._page_load_changed)
             self.webview.connect("create", self._create_popup)
             self.webview.connect("decide-policy", self._decide_policy)
             self.window.add(self.webview)
@@ -2993,6 +3768,13 @@ def build_application(show_on_start: bool = False):
                 payload = json.loads(raw)
                 if not isinstance(payload, dict):
                     return
+                if payload.get("event") == "page-play":
+                    # The web player started: it wins, so only one player is audible.
+                    self.page_playing = True
+                    if self.playback.playing:
+                        self.playback.pause()
+                    GLib.timeout_add(150, self._publish_status_once)
+                    return
                 request_id = payload.get("requestId")
                 if (isinstance(request_id, bool) or not isinstance(request_id, int)
                         or request_id != self.selection_generation):
@@ -3088,8 +3870,166 @@ def build_application(show_on_start: bool = False):
             except Exception:
                 pass
 
+        def _page_load_changed(self, _webview, event):
+            if event == WebKit2.LoadEvent.FINISHED:
+                # A fresh page forgets the volume; hand it over again.
+                self._evaluate(volume_script(self.playback.volume), lambda _payload: None)
+
+        def _run_internal(self, command):
+            if not self.dispatch_slots.acquire(blocking=False):
+                return
+            GLib.idle_add(self._handle_command_safely, command, _NullConnection(), None)
+
+        def _list_tracks(self, source):
+            if source in {"home", "feed"}:
+                return self.track_cache.get(source, [])
+            return self.lists.get(source, [])
+
+        def _set_queue(self, source, playback_id):
+            tracks = [
+                track for track in self._list_tracks(source)
+                if is_playback_id(track.get("playbackId"))
+            ][:MAX_QUEUE]
+            ids = [track["playbackId"] for track in tracks]
+            if playback_id not in ids:
+                return False
+            self.queue = list(tracks)
+            self.queue_index = ids.index(playback_id)
+            self.queue_source = source
+            for track in tracks:
+                self.playback_tracks.setdefault(track["playbackId"], track)
+            return True
+
+        def _queue_for_unsourced_play(self, playback_id):
+            for source in ("search", "collection", "likes", "home", "feed"):
+                if self._set_queue(source, playback_id):
+                    return
+            self.queue, self.queue_index, self.queue_source = [], -1, ""
+
+        def _start_track(self, playback_id, done=None, resume_at=0.0):
+            finish = done or (lambda _ok, _error: None)
+            metadata = self.playback_tracks.get(playback_id)
+            if metadata is None:
+                finish(False, "SoundCloud track details are not ready")
+                return
+            self.restored = None
+            self.pending_seek = max(0.0, float(resume_at))
+            self.selection_generation = (self.selection_generation + 1) % (2**31)
+            generation = self.selection_generation
+            self.playback.begin(metadata)
+            self._publish_status_once()
+
+            def track_selected(payload):
+                if generation != self.selection_generation:
+                    finish(False, "selection superseded")
+                    return
+                if not payload:
+                    self.playback.stop("SoundCloud track details are not ready")
+                finish(bool(payload), "" if payload else "SoundCloud track details are not ready")
+
+            self._evaluate(play_track_script(playback_id, generation), track_selected)
+            GLib.timeout_add_seconds(15, self._resolution_timed_out, generation)
+
+        def _advance(self, step, done=None):
+            target = queue_step(len(self.queue), self.queue_index, step)
+            if target is None and step == 1 and self.queue:
+                # The list is over; carry on with tracks related to the last one.
+                self._autoplay_related(done)
+                return True
+            if target is None:
+                if done:
+                    done(False, "No more tracks in this list")
+                return False
+            self.queue_index = target
+            self._start_track(self.queue[target]["playbackId"], done)
+            return True
+
+        def _autoplay_related(self, done=None):
+            finish = done or (lambda _ok, _error: None)
+            last = self.queue[self.queue_index] if 0 <= self.queue_index < len(self.queue) else self.queue[-1]
+            playback_id = str(last.get("playbackId") or "")
+            if not is_playback_id(playback_id) or not self.webview \
+                    or not is_soundcloud_uri(self.webview.get_uri() or ""):
+                finish(False, "No more tracks in this list")
+                return
+            generation = self.selection_generation
+
+            def finished(webview, async_result, _data):
+                try:
+                    value = webview.call_async_javascript_function_finish(async_result)
+                    raw = value.to_string() if value.is_string() else ""
+                    payload = json.loads(raw) if raw and len(raw.encode("utf-8")) <= MAX_RESPONSE_BYTES else {}
+                except Exception:
+                    payload = {}
+                validated = validate_tracks_payload({"tracks": payload.get("tracks", [])}) \
+                    if isinstance(payload, dict) else None
+                if generation != self.selection_generation:
+                    finish(False, "selection superseded")
+                    return
+                queue, index = extend_queue(self.queue, self.queue_index, validated["tracks"] if validated else [])
+                if index + 1 >= len(queue):
+                    finish(False, "No more tracks in this list")
+                    return
+                for track in queue[index + 1:]:
+                    self.playback_tracks.setdefault(track["playbackId"], track)
+                self.queue, self.queue_index = queue, index + 1
+                self._start_track(queue[index + 1]["playbackId"], finish)
+
+            self.webview.call_async_javascript_function(
+                RELATED_TRACKS_FUNCTION, -1,
+                GLib.Variant("a{sv}", {"id": GLib.Variant("d", float(playback_id.rpartition(":")[2]))}),
+                None, None, None, finished, None,
+            )
+
+        def _playback_changed(self):
+            if self.pending_seek and self.playback.playing:
+                duration = float(self.playback.metadata.get("durationMs", 0) or 0) / 1000
+                if duration > 0:
+                    self.playback.seek(min(1.0, self.pending_seek / duration))
+                self.pending_seek = 0.0
+            if self.playback.ended:
+                self.playback.ended = False
+                self._advance(1)
+            if self.playback.state in {"playing", "paused"}:
+                self._save_player_state()
+            self._publish_status_once()
+            return False
+
+        def _player_snapshot(self):
+            snapshot: dict[str, object] = {"volume": self.playback.volume}
+            if self.playback.active:
+                track = self.playback.metadata
+                position = self.playback._query_time("query_position")
+            elif self.restored:
+                track = self.restored["track"]
+                position = self.restored.get("position", 0.0)
+            else:
+                return snapshot
+            if not is_playback_id(track.get("playbackId")):
+                return snapshot
+            snapshot["track"] = {
+                key: track.get(key) for key in
+                ("playbackId", "title", "artist", "url", "artUrl", "playCount", "durationMs")
+            }
+            snapshot["position"] = max(0.0, float(position or 0))
+            if self.queue and 0 <= self.queue_index < len(self.queue):
+                snapshot["queue"] = self.queue
+                snapshot["queueIndex"] = self.queue_index
+                snapshot["queueSource"] = self.queue_source
+            return snapshot
+
+        def _save_player_state(self):
+            self.last_state_save = time.monotonic()
+            try:
+                player_state_store.save(self._player_snapshot())
+            except (OSError, TypeError, ValueError):
+                pass
+
         def _hide_window(self, *_args):
             self.window.hide()
+            # Closing the window stops SoundCloud's web player; the bar's own
+            # player is unaffected.
+            self._evaluate(command_script("pause-page"), lambda _payload: self._publish_status_once())
             return True
 
         def show_login(self):
@@ -3098,7 +4038,7 @@ def build_application(show_on_start: bool = False):
 
         def _create_popup(self, source, _navigation_action):
             popup = WebKit2.WebView.new_with_related_view(source)
-            popup.connect("decide-policy", self._decide_policy)
+            popup.connect("decide-policy", self._decide_popup_policy)
             popup_window = Gtk.Window(application=self)
             popup_window.set_default_size(720, 720)
             popup_window.set_title("SoundCloud sign in")
@@ -3116,6 +4056,20 @@ def build_application(show_on_start: bool = False):
             request = decision.get_request()
             uri = request.get_uri() if request else ""
             if is_soundcloud_uri(uri) or is_bot_check_uri(uri):
+                decision.use()
+            else:
+                decision.ignore()
+            return True
+
+        def _decide_popup_policy(self, _webview, decision, decision_type):
+            if decision_type not in {
+                WebKit2.PolicyDecisionType.NAVIGATION_ACTION,
+                WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION,
+            }:
+                return False
+            request = decision.get_request()
+            uri = request.get_uri() if request else ""
+            if is_soundcloud_uri(uri) or is_bot_check_uri(uri) or is_sign_in_provider_uri(uri):
                 decision.use()
             else:
                 decision.ignore()
@@ -3150,13 +4104,41 @@ def build_application(show_on_start: bool = False):
             GLib.idle_add(self._publish_status_once)
 
         def _secure_status(self, payload):
-            if self.playback.state != "idle":
+            if isinstance(payload, dict) and "pagePlaying" in payload:
+                self.page_playing = payload.get("pagePlaying") is True
+                self.page_media_present = payload.get("playerPresent") is True
+            if (self.restored and self.playback.state == "idle"
+                    and not self.page_playing and not self.page_media_present):
+                # The last track from before a restart, ready to resume.
+                track = self.restored["track"]
+                base = payload if isinstance(payload, dict) else {}
+                payload = {
+                    **base,
+                    "playerPresent": True,
+                    "playbackState": "paused",
+                    "playing": False,
+                    "playbackId": track["playbackId"],
+                    "title": track["title"],
+                    "artist": track["artist"],
+                    "artUrl": track.get("artUrl", ""),
+                    "duration": float(track.get("durationMs", 0) or 0) / 1000,
+                    "position": float(self.restored.get("position", 0.0)),
+                    "waveform": [],
+                }
+            # Show whichever player is audible; the bar's player only when the
+            # web player is not.
+            if self.playback.state != "idle" and not (self.page_playing and not self.playback.playing):
                 base = payload if isinstance(payload, dict) else {}
                 payload = {**base, **self.playback.status()}
+            elif self.page_playing and isinstance(payload, dict):
+                payload = {**payload, "playing": True, "playbackState": "playing"}
             state = validate_status_payload(payload)
             if state is None:
                 return {}
-            remote_art = state.pop("artUrl")
+            # A fixed mid-size rendition: SoundCloud's full-size artwork can
+            # exceed the fetcher's limits, and the bar only needs 300px.
+            remote_art = normalize_list_artwork_url(state.pop("artUrl"), "t300x300")
+            self.last_art_url = remote_art
             state["artDataUrl"] = self.artwork_cache.get(
                 remote_art, self._artwork_ready_from_thread
             )
@@ -3169,6 +4151,8 @@ def build_application(show_on_start: bool = False):
                         lambda: GLib.idle_add(self._publish_status_once)
                     )
             state["liked"] = liked is True
+            state["volume"] = round(self.playback.volume, 3)
+            state["queueSource"] = self.queue_source if self.queue else ""
             return state
 
         def _secure_tracks(self, payload):
@@ -3202,14 +4186,20 @@ def build_application(show_on_start: bool = False):
             return False
 
         def _publish_status(self):
-            if not self.status_subscribers or self.status_evaluation_pending:
+            # Runs even without a bar subscriber so MPRIS stays current.
+            if self.status_evaluation_pending:
                 return True
             self.status_evaluation_pending = True
 
             def finished(payload):
                 self.status_evaluation_pending = False
                 state = self._secure_status(payload)
-                self.status_subscribers.publish({"running": True, **state})
+                if self.mpris is not None and state:
+                    self.mpris.update(state, self.last_art_url, self.playback.volume)
+                if self.playback.playing and time.monotonic() - self.last_state_save > 15:
+                    self._save_player_state()
+                if self.status_subscribers:
+                    self.status_subscribers.publish({"running": True, **state})
 
             self._evaluate(status_script(), finished)
             return True
@@ -3272,7 +4262,13 @@ def build_application(show_on_start: bool = False):
                     load_more_script(source),
                     load_more_finished,
                 )
-            elif (source := track_source_from_command(command)) is not None:
+            elif (source := track_source_from_command(command)) in self.cached_sources:
+                result = self._secure_tracks({"tracks": self.track_cache.get(source, [])})
+                self._respond(connection, request_id, {
+                    "ok": result is not None, "running": True, "cached": True,
+                    **(result or {"tracks": []}),
+                })
+            elif source is not None:
                 def tracks_finished(payload):
                     pending = isinstance(payload, dict) and payload.get("pending") is True
                     remote_error = (
@@ -3347,26 +4343,115 @@ def build_application(show_on_start: bool = False):
                             data_url,
                         ),
                     )
-            elif command in {"play-pause", "next", "previous"}:
-                if command == "play-pause" and self.playback.active:
-                    self._respond(
+            elif command == "play-pause":
+                # Act on whichever player is audible, and never leave two playing.
+                def toggle_audible_player(payload):
+                    page_playing = isinstance(payload, dict) and payload.get("pagePlaying") is True
+                    self.page_playing = page_playing
+                    respond = lambda result: self._respond(
                         connection,
                         request_id,
-                        {"ok": self.playback.toggle(), "running": True},
+                        {"ok": bool(result), "running": True},
                         publish_status=True,
                     )
+                    if page_playing:
+                        if self.playback.playing:
+                            self.playback.pause()
+                        self._evaluate(command_script("pause-page"), respond)
+                    elif self.playback.active:
+                        respond(self.playback.toggle())
+                    elif (self.restored and self.playback.state in {"idle", "error"}
+                            and not (isinstance(payload, dict) and payload.get("playerPresent") is True)):
+                        # Resume the track from before the restart where it stopped.
+                        restored = self.restored
+                        self._start_track(
+                            restored["track"]["playbackId"],
+                            lambda ok, error: self._respond(
+                                connection, request_id,
+                                {"ok": ok, "running": True, **({"error": error} if error else {})},
+                                publish_status=True,
+                            ),
+                            resume_at=float(restored.get("position", 0.0)),
+                        )
+                    else:
+                        self._evaluate(command_script("play-pause"), respond)
+
+                self._evaluate(status_script(), toggle_audible_player)
+            elif command in {"next", "previous"}:
+                respond_step = lambda ok, error="": self._respond(
+                    connection, request_id,
+                    {"ok": ok, "running": True, **({"error": error} if error else {})},
+                    publish_status=True,
+                )
+                bar_player_current = (
+                    self.playback.active or self.playback.state in {"resolving", "error"}
+                    or bool(self.restored)
+                )
+                if self.queue and bar_player_current and not self.page_playing:
+                    # Walk the list the current track came from.
+                    position = self.playback._query_time("query_position") if self.playback.active else 0.0
+                    if command == "previous" and position > 3:
+                        respond_step(self.playback.seek(0.0))
+                    else:
+                        self._advance(1 if command == "next" else -1, respond_step)
+                elif command == "previous" and self.playback.active and not self.page_playing:
+                    respond_step(self.playback.seek(0.0))
                 else:
                     if self.playback.active or self.playback.error:
                         self.playback.stop()
+                    self.restored = None
                     self._evaluate(
                         command_script(command),
-                        lambda payload: self._respond(
-                            connection,
-                            request_id,
-                            {"ok": bool(payload), "running": True},
-                            publish_status=True,
-                        ),
+                        lambda payload: respond_step(bool(payload)),
                     )
+            elif (search := search_from_command(command)) is not None:
+                kind, query = search
+                self._page_list(
+                    SEARCH_TRACKS_FUNCTION,
+                    {"query": GLib.Variant("s", query), "kind": GLib.Variant("s", kind)},
+                    "search" if kind == "tracks" else "",
+                    connection, request_id, {"query": query, "kind": kind},
+                )
+            elif command.partition(":")[0] in SEARCH_KINDS:
+                self._respond(connection, request_id, {"ok": False, "error": "Enter a shorter search"})
+            elif (collection := collection_from_command(command)) is not None:
+                kind, identifier = collection
+                self._page_list(
+                    OPEN_COLLECTION_FUNCTION,
+                    {"kind": GLib.Variant("s", kind), "id": GLib.Variant("d", float(identifier))},
+                    "collection", connection, request_id, {"kind": kind, "collectionId": identifier},
+                )
+            elif command == "likes":
+                self._page_list(LIKED_TRACKS_FUNCTION, {}, "likes", connection, request_id, {})
+            elif command == "mixes":
+                self._load_mixes(connection, request_id, 0)
+            elif (shuffle_source := shuffle_from_command(command)) is not None:
+                current = self.queue[self.queue_index].get("playbackId", "") if 0 <= self.queue_index < len(self.queue) else ""
+                tracks = shuffled_tracks(self._list_tracks(shuffle_source), current)
+                if not tracks:
+                    self._respond(connection, request_id, {"ok": False, "error": "Nothing to shuffle yet"})
+                else:
+                    self.queue, self.queue_index, self.queue_source = tracks, 0, shuffle_source
+                    for track in tracks:
+                        self.playback_tracks.setdefault(track["playbackId"], track)
+
+                    def shuffle_started(ok, error):
+                        self._respond(
+                            connection, request_id,
+                            {"ok": ok, "running": True, "shuffled": len(tracks), **({"error": error} if error else {})},
+                            publish_status=ok or error != "selection superseded",
+                        )
+
+                    self._start_track(tracks[0]["playbackId"], shuffle_started)
+            elif (volume := volume_from_command(command)) is not None:
+                self.playback.set_volume(volume)
+                self._evaluate(volume_script(volume), lambda _payload: None)
+                self._save_player_state()
+                self._respond(
+                    connection, request_id,
+                    {"ok": True, "running": True, "volume": volume},
+                    publish_status=True,
+                )
             elif command.startswith("seek:"):
                 try:
                     ratio = float(command.partition(":")[2])
@@ -3377,7 +4462,7 @@ def build_application(show_on_start: bool = False):
                         {"ok": False, "error": "invalid seek position"},
                     )
                 else:
-                    if self.playback.active:
+                    if self.playback.active and not self.page_playing:
                         self._respond(
                             connection,
                             request_id,
@@ -3394,44 +4479,25 @@ def build_application(show_on_start: bool = False):
                                 publish_status=True,
                             ),
                         )
-            elif (playback_id := playback_id_from_command(command)) is not None:
-                metadata = self.playback_tracks.get(playback_id)
-                if metadata is None:
+            elif ((queued := queued_play_from_command(command)) is not None
+                    or playback_id_from_command(command) is not None):
+                if queued is not None:
+                    source, playback_id = queued
+                    if not self._set_queue(source, playback_id):
+                        self._queue_for_unsourced_play(playback_id)
+                else:
+                    playback_id = playback_id_from_command(command)
+                    self._queue_for_unsourced_play(playback_id)
+
+                def track_started(ok, error):
                     self._respond(
                         connection,
                         request_id,
-                        {"ok": False, "error": "SoundCloud track details are not ready"},
-                    )
-                    return False
-                self.selection_generation = (self.selection_generation + 1) % (2**31)
-                generation = self.selection_generation
-                self.playback.begin(metadata)
-                self._publish_status_once()
-                script = play_track_script(playback_id, generation)
-
-                def track_selected(payload):
-                    if generation != self.selection_generation:
-                        self._respond(
-                            connection,
-                            request_id,
-                            {"ok": False, "error": "selection superseded"},
-                        )
-                        return
-                    if not payload:
-                        self.playback.stop("SoundCloud track details are not ready")
-                    self._respond(
-                        connection,
-                        request_id,
-                        {
-                            "ok": bool(payload),
-                            "running": True,
-                            **({} if payload else {"error": "SoundCloud track details are not ready"}),
-                        },
-                        publish_status=True,
+                        {"ok": ok, "running": True, **({"error": error} if error else {})},
+                        publish_status=ok or error != "selection superseded",
                     )
 
-                self._evaluate(script, track_selected)
-                GLib.timeout_add_seconds(15, self._resolution_timed_out, generation)
+                self._start_track(playback_id, track_started)
             elif (like := track_like_from_command(command)) is not None:
                 playback_id, liked = like
 
@@ -3449,10 +4515,21 @@ def build_application(show_on_start: bool = False):
                     )
 
                 threading.Thread(target=update_like, daemon=True).start()
-            elif source_uri(command):
-                self._publish_cached_tracks(command)
-                self.webview.load_uri(source_uri(command))
-                self._respond(connection, request_id, {"ok": True, "running": True})
+            elif source_uri(command) or (
+                    command.startswith("refresh:") and source_uri(command.removeprefix("refresh:"))):
+                forced = command.startswith("refresh:")
+                source = command.removeprefix("refresh:")
+                if (not forced and source in {"home", "feed"} and self.track_cache.get(source)
+                        and (self.page_media_present or self.page_playing)):
+                    # Reloading would drop the web player's track; answer from cache.
+                    self.cached_sources.add(source)
+                    self._publish_cached_tracks(source)
+                    self._respond(connection, request_id, {"ok": True, "running": True, "cached": True})
+                else:
+                    self.cached_sources.discard(source)
+                    self._publish_cached_tracks(source)
+                    self.webview.load_uri(source_uri(source))
+                    self._respond(connection, request_id, {"ok": True, "running": True})
             elif command == "show":
                 self.show_login()
                 self._respond(connection, request_id, {"ok": True, "running": True})
@@ -3462,6 +4539,103 @@ def build_application(show_on_start: bool = False):
             else:
                 self._respond(connection, request_id, {"ok": False, "error": "unknown command"})
             return False
+
+        def _secure_collections(self, collections):
+            for item in collections:
+                remote_art = normalize_list_artwork_url(item.pop("artUrl"))
+                item["artworkId"] = ""
+                if remote_art:
+                    token = hashlib.sha256(remote_art.encode("utf-8")).hexdigest()[:24]
+                    self.track_artwork_urls[token] = remote_art
+                    self.track_artwork_urls.move_to_end(token)
+                    while len(self.track_artwork_urls) > 200:
+                        self.track_artwork_urls.popitem(last=False)
+                    item["artworkId"] = token
+            return collections
+
+        def _load_mixes(self, connection, request_id, attempt):
+            """Mixes come from Home's selections; load Home first when the page has none."""
+            def needs_home():
+                if attempt == 0:
+                    if self.page_media_present or self.page_playing:
+                        self._respond(connection, request_id, {
+                            "ok": False, "running": True, "tracks": [], "collections": [],
+                            "error": "Open Home once to load your mixes",
+                        })
+                        return
+                    self.cached_sources.discard("home")
+                    self.webview.load_uri(source_uri("home"))
+                if attempt >= 15:
+                    self._respond(connection, request_id, {
+                        "ok": False, "running": True, "tracks": [], "collections": [],
+                        "error": "SoundCloud mixes did not load",
+                    })
+                    return
+                GLib.timeout_add(1000, lambda: self._load_mixes(connection, request_id, attempt + 1) and False)
+
+            self._page_list(MIXES_FUNCTION, {}, "", connection, request_id, {}, needs_home)
+
+        def _page_list(self, function, arguments, list_name, connection, request_id, echo, needs_home=None):
+            """Run a page list function (search, likes, playlist, artist) and answer with its rows."""
+            def respond(payload):
+                self._respond(connection, request_id, {"running": True, **echo, **payload})
+
+            def failed(error):
+                respond({"ok": False, "tracks": [], "collections": [], "error": error})
+
+            def finished(webview, async_result, _data):
+                try:
+                    value = webview.call_async_javascript_function_finish(async_result)
+                    raw = value.to_string() if value.is_string() else ""
+                    if not raw or len(raw.encode("utf-8")) > MAX_RESPONSE_BYTES:
+                        failed("SoundCloud request failed")
+                        return
+                    payload = json.loads(raw)
+                except Exception:
+                    failed("SoundCloud request failed")
+                    return
+                if not isinstance(payload, dict):
+                    failed("SoundCloud request failed")
+                    return
+                if needs_home and payload.get("needsHome") is True:
+                    needs_home()
+                    return
+                error = _bounded_string(payload.get("error", ""), 128) or ""
+                if payload.get("collections"):
+                    collections = validate_collections_payload(payload)
+                    if collections is None:
+                        failed("SoundCloud returned invalid results")
+                        return
+                    respond({
+                        "ok": not error, "tracks": [],
+                        "collections": self._secure_collections(collections),
+                        **({"error": error} if error else {}),
+                    })
+                    return
+                validated = validate_tracks_payload({"tracks": payload.get("tracks", [])})
+                if validated is None:
+                    failed("SoundCloud returned invalid results")
+                    return
+                for track in validated["tracks"]:
+                    playback_id = track.get("playbackId")
+                    if is_playback_id(playback_id):
+                        self.playback_tracks[playback_id] = track
+                while len(self.playback_tracks) > MAX_TRACKS * 4:
+                    self.playback_tracks.pop(next(iter(self.playback_tracks)))
+                if list_name and not error:
+                    self.lists[list_name] = validated["tracks"]
+                result = self._secure_tracks(validated) or {"tracks": []}
+                respond({
+                    "ok": not error, "collections": [], **result,
+                    **({"error": error} if error else {}),
+                })
+
+            if not self.webview or not is_soundcloud_uri(self.webview.get_uri() or ""):
+                failed("SoundCloud is still loading")
+                return
+            self.webview.call_async_javascript_function(
+                function, -1, GLib.Variant("a{sv}", arguments), None, None, None, finished, None
+            )
 
         def _write_like_in_page(self, user_id, track_id, liked, token):
             """Run on a worker thread; blocks until the page's fetch finishes."""
