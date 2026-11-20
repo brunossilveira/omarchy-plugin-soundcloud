@@ -67,6 +67,17 @@ ARTWORK_HOSTS = {"i1.sndcdn.com"}
 MAX_WAVEFORM_BARS = 200
 # SoundCloud's bot protection (DataDome) shows its captcha in an iframe from here.
 BOT_CHECK_HOSTS = {"geo.captcha-delivery.com"}
+# "Continue with Google/Apple/Facebook" opens a popup on these providers.
+# Only sign-in popups may navigate here; the main view stays on SoundCloud.
+SIGN_IN_PROVIDER_HOSTS = {
+    "accounts.google.com",
+    "accounts.youtube.com",
+    "appleid.apple.com",
+    "idmsa.apple.com",
+    "www.facebook.com",
+    "m.facebook.com",
+    "facebook.com",
+}
 SOUNDCLOUD_WEB_HOSTS = {
     "soundcloud.com",
     "www.soundcloud.com",
@@ -601,6 +612,25 @@ def is_bot_check_uri(uri: str) -> bool:
         and parsed.password is None
         and port in (None, 443)
     )
+
+
+def is_sign_in_provider_uri(uri: str) -> bool:
+    try:
+        parsed = urlparse(uri)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+    ):
+        return False
+    host = parsed.hostname.lower().rstrip(".")
+    # Google bounces through its country domains to set cookies.
+    return host in SIGN_IN_PROVIDER_HOSTS or re.fullmatch(r"accounts\.google(\.com?)?\.[a-z]{2,3}", host) is not None
 
 
 def is_playback_id(value: object) -> bool:
@@ -3098,7 +3128,7 @@ def build_application(show_on_start: bool = False):
 
         def _create_popup(self, source, _navigation_action):
             popup = WebKit2.WebView.new_with_related_view(source)
-            popup.connect("decide-policy", self._decide_policy)
+            popup.connect("decide-policy", self._decide_popup_policy)
             popup_window = Gtk.Window(application=self)
             popup_window.set_default_size(720, 720)
             popup_window.set_title("SoundCloud sign in")
@@ -3116,6 +3146,20 @@ def build_application(show_on_start: bool = False):
             request = decision.get_request()
             uri = request.get_uri() if request else ""
             if is_soundcloud_uri(uri) or is_bot_check_uri(uri):
+                decision.use()
+            else:
+                decision.ignore()
+            return True
+
+        def _decide_popup_policy(self, _webview, decision, decision_type):
+            if decision_type not in {
+                WebKit2.PolicyDecisionType.NAVIGATION_ACTION,
+                WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION,
+            }:
+                return False
+            request = decision.get_request()
+            uri = request.get_uri() if request else ""
+            if is_soundcloud_uri(uri) or is_bot_check_uri(uri) or is_sign_in_provider_uri(uri):
                 decision.use()
             else:
                 decision.ignore()

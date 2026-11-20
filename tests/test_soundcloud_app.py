@@ -241,6 +241,17 @@ class UriPolicyTest(unittest.TestCase):
         self.assertFalse(app.is_bot_check_uri("https://user@geo.captcha-delivery.com/"))
         self.assertFalse(app.is_bot_check_uri("https://example.org/captcha/"))
 
+    def test_sign_in_provider_uris(self):
+        app = load_module()
+        self.assertTrue(app.is_sign_in_provider_uri("https://accounts.google.com/o/oauth2/v2/auth?x=1"))
+        self.assertTrue(app.is_sign_in_provider_uri("https://accounts.google.co.za/accounts/SetSID"))
+        self.assertTrue(app.is_sign_in_provider_uri("https://appleid.apple.com/auth/authorize"))
+        self.assertTrue(app.is_sign_in_provider_uri("https://www.facebook.com/v12.0/dialog/oauth"))
+        self.assertFalse(app.is_sign_in_provider_uri("http://accounts.google.com/"))
+        self.assertFalse(app.is_sign_in_provider_uri("https://accounts.google.com.example.org/"))
+        self.assertFalse(app.is_sign_in_provider_uri("https://user@accounts.google.com/"))
+        self.assertFalse(app.is_sign_in_provider_uri("https://evil.google.com/"))
+
 
 class GraphicsWorkaroundTest(unittest.TestCase):
     def test_disables_webkit_dmabuf_on_hyprland(self):
