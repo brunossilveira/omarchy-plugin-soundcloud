@@ -655,13 +655,15 @@ def is_allowed_artwork_uri(uri: str) -> bool:
     )
 
 
-def normalize_list_artwork_url(uri: object) -> str:
+def normalize_list_artwork_url(uri: object, size: str = "t120x120") -> str:
     if not isinstance(uri, str) or not is_allowed_artwork_uri(uri):
+        return ""
+    if not re.fullmatch(r"t\d{2,3}x\d{2,3}", size):
         return ""
     parsed = urlparse(uri)
     path = re.sub(
         r"-(?:large|original|t\d+x\d+)(\.(?:jpe?g|png))$",
-        r"-t120x120\1",
+        rf"-{size}\1",
         parsed.path,
         flags=re.IGNORECASE,
     )
@@ -3359,7 +3361,9 @@ def build_application(show_on_start: bool = False):
             state = validate_status_payload(payload)
             if state is None:
                 return {}
-            remote_art = state.pop("artUrl")
+            # A fixed mid-size rendition: SoundCloud's full-size artwork can
+            # exceed the fetcher's limits, and the bar only needs 300px.
+            remote_art = normalize_list_artwork_url(state.pop("artUrl"), "t300x300")
             state["artDataUrl"] = self.artwork_cache.get(
                 remote_art, self._artwork_ready_from_thread
             )

@@ -31,13 +31,16 @@ BarWidget {
   property var tracks: []
   property var homeTracks: []
   property var feedTracks: []
+  property var searchTracks: []
+  property string searchQuery: ""
+  property bool searchPending: false
   property var trackArtworkData: ({})
   property var trackArtworkPending: ({})
   property bool tracksLoading: false
   property bool homeLoadMorePending: false
   property bool feedLoadMorePending: false
   readonly property bool loadMorePending: selectedTab === "home"
-    ? homeLoadMorePending : feedLoadMorePending
+    ? homeLoadMorePending : (selectedTab === "feed" ? feedLoadMorePending : false)
   property bool homeHasMore: true
   property bool feedHasMore: true
   property int homeLoadMoreAtCount: 0
@@ -76,6 +79,7 @@ BarWidget {
 
   function open() {
     popupOpen = true
+    if (selectedTab === "search") focusSearchField()
     if (!backendConnected) startBackend(false)
     else if (tracks.length === 0) selectTab(selectedTab)
   }
@@ -103,6 +107,7 @@ BarWidget {
   }
 
   function refreshTracks() {
+    if (selectedTab === "search") return
     if (!popupOpen || tracksRequestPending || !backendConnected || !running || !loggedIn) return
     tracksLoading = true
     trackLoadAttempts += 1
@@ -110,6 +115,13 @@ BarWidget {
   }
 
   function selectTab(tab) {
+    if (tab === "search") {
+      selectedTab = tab
+      tracks = searchTracks
+      tracksLoading = searchPending
+      focusSearchField()
+      return
+    }
     selectedTab = tab
     tracks = tab === "home" ? homeTracks : feedTracks
     tracksLoading = true
@@ -118,7 +130,41 @@ BarWidget {
     refreshTracks()
   }
 
+  // The popup only gets keyboard focus once its focus grab is active, which
+  // can land after the click that selected the tab. Keep retrying briefly
+  // until the field actually holds focus.
+  function focusSearchField() {
+    searchFocusTimer.attempts = 0
+    searchFocusTimer.restart()
+  }
+
+  function runSearch(text) {
+    var query = String(text || "").trim()
+    if (query === "" || !backendConnected || !running || !loggedIn) return
+    searchQuery = query
+    searchPending = true
+    lastError = ""
+    if (selectedTab === "search") tracksLoading = true
+    if (sendCommand("search:" + query, "search") === 0) {
+      searchPending = false
+      tracksLoading = false
+    }
+  }
+
+  function applySearchResult(message) {
+    if (String(message.query || "") !== searchQuery) return
+    searchPending = false
+    searchTracks = Array.isArray(message.tracks) ? message.tracks.slice(0, 100) : []
+    if (message.ok !== true) lastError = String(message.error || "SoundCloud search failed")
+    if (selectedTab === "search") {
+      tracks = searchTracks
+      tracksLoading = false
+      trackList.contentY = trackList.originY
+    }
+  }
+
   function loadMoreTracks(yPosition, heightRatio, atEnd, userInitiated) {
+    if (selectedTab === "search") return
     var requestedCount = selectedTab === "home" ? homeLoadMoreAtCount : feedLoadMoreAtCount
     var hasMore = selectedTab === "home" ? homeHasMore : feedHasMore
     if (!backendConnected || !running || !loggedIn
@@ -236,7 +282,7 @@ BarWidget {
     reconnectAttempt = 0
     sendCommand("subscribe", "subscribe")
     sendCommand("status", "status")
-    if (popupOpen && running && loggedIn) {
+    if (popupOpen && running && loggedIn && selectedTab !== "search") {
       sendCommand(selectedTab, "action")
       trackReloadTimer.restart()
     }
@@ -249,6 +295,7 @@ BarWidget {
     tracksRequestPending = false
     homeLoadMorePending = false
     feedLoadMorePending = false
+    searchPending = false
     trackArtworkPending = ({})
     tracksLoading = false
     trackLoadAttempts = 0
@@ -349,7 +396,7 @@ BarWidget {
       artist = String(state.artist || "").slice(0, 256)
       waveformLevels = Array.isArray(state.waveform) ? state.waveform : []
     }
-    if (popupOpen && loggedIn && !wasLoggedIn && tracks.length === 0) {
+    if (popupOpen && loggedIn && !wasLoggedIn && tracks.length === 0 && selectedTab !== "search") {
       sendCommand(selectedTab, "action")
       trackReloadTimer.restart()
     }
@@ -427,6 +474,8 @@ BarWidget {
         artworkData[artworkId] = trackArtDataUrl
         trackArtworkData = artworkData
       }
+    } else if (kind === "search") {
+      applySearchResult(message)
     } else if (kind === "like") {
       likeBusy = false
       if (message.ok !== true) lastError = String(message.error || "SoundCloud could not update this like")
@@ -473,13 +522,23 @@ BarWidget {
   implicitWidth: row.implicitWidth + Style.space(14)
   implicitHeight: barSize
 
+  // Now-playing details in the bar itself (horizontal bars only).
+  readonly property bool showNowPlaying: !root.vertical && root.hasTrack
+    && root.setting("showTitle", true) !== false
+  readonly property bool showBarArt: showNowPlaying && root.artDataUrl !== ""
+
+  readonly property bool showBarControls: showNowPlaying && root.running && root.loggedIn
+    && root.setting("showControls", true) !== false
+
   Row {
     id: row
     anchors.centerIn: parent
     spacing: Style.space(6)
+    z: 1
 
     Text {
       anchors.verticalCenter: parent.verticalCenter
+      visible: !root.showBarArt
       textFormat: Text.PlainText
       text: ""
       color: SoundCloudModel.barIconColor(root.playing, Color.accent, root.bar.barForeground)
@@ -487,6 +546,165 @@ BarWidget {
       font.pixelSize: Style.font.body
     }
 
+    Image {
+      id: barArt
+      anchors.verticalCenter: parent.verticalCenter
+      visible: root.showBarArt
+      width: Math.round(root.barSize * 0.62)
+      height: width
+      fillMode: Image.PreserveAspectCrop
+      asynchronous: true
+      smooth: true
+      sourceSize.width: 64
+      sourceSize.height: 64
+      source: root.showBarArt ? root.artDataUrl : ""
+      opacity: root.playing ? 1 : 0.6
+    }
+
+    Item {
+      id: marquee
+      anchors.verticalCenter: parent.verticalCenter
+      visible: root.showNowPlaying
+      readonly property real maxWidth: Style.space(Number(root.setting("titleWidth", 170)) || 170)
+      readonly property real overflow: Math.max(0, marqueeText.implicitWidth - maxWidth)
+      width: visible ? Math.min(marqueeText.implicitWidth, maxWidth) : 0
+      height: marqueeText.implicitHeight
+      clip: true
+
+      Text {
+        id: marqueeText
+        textFormat: Text.PlainText
+        text: root.label
+        color: root.playing ? root.bar.barForeground : root.dim
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        onTextChanged: {
+          x = 0
+          if (marqueeAnimation.running) marqueeAnimation.restart()
+        }
+      }
+
+      // Scroll long titles back and forth, pausing at each end.
+      SequentialAnimation {
+        id: marqueeAnimation
+        running: marquee.visible && marquee.overflow > 0
+        loops: Animation.Infinite
+        onRunningChanged: if (!running) marqueeText.x = 0
+        PauseAnimation { duration: 2000 }
+        NumberAnimation {
+          target: marqueeText
+          property: "x"
+          from: 0
+          to: -marquee.overflow
+          duration: Math.max(1200, marquee.overflow * 35)
+          easing.type: Easing.Linear
+        }
+        PauseAnimation { duration: 1500 }
+        NumberAnimation {
+          target: marqueeText
+          property: "x"
+          to: 0
+          duration: 500
+          easing.type: Easing.InOutQuad
+        }
+      }
+    }
+
+    Text {
+      id: barPrevious
+      anchors.verticalCenter: parent.verticalCenter
+      leftPadding: Style.space(2)
+      rightPadding: Style.space(2)
+      visible: root.showBarControls
+      textFormat: Text.PlainText
+      text: "󰒮"
+      color: barPreviousMouse.containsMouse ? Color.accent : root.bar.barForeground
+      opacity: enabled ? 1 : 0.4
+      font.family: root.bar.fontFamily
+      font.pixelSize: Style.font.icon
+
+      MouseArea {
+        id: barPreviousMouse
+        anchors.fill: parent
+        anchors.margins: -Style.space(3)
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        enabled: !root.actionBusy
+        onClicked: root.runAction("previous")
+      }
+    }
+
+    Text {
+      id: barPlayPause
+      anchors.verticalCenter: parent.verticalCenter
+      leftPadding: Style.space(2)
+      rightPadding: Style.space(2)
+      visible: root.showBarControls
+      textFormat: Text.PlainText
+      text: root.playIcon
+      color: barPlayPauseMouse.containsMouse ? Color.accent : root.bar.barForeground
+      opacity: enabled ? 1 : 0.4
+      font.family: root.bar.fontFamily
+      font.pixelSize: Style.font.icon
+
+      MouseArea {
+        id: barPlayPauseMouse
+        anchors.fill: parent
+        anchors.margins: -Style.space(3)
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        enabled: !root.actionBusy
+        onClicked: root.runAction("play-pause")
+      }
+    }
+
+    Text {
+      id: barNext
+      anchors.verticalCenter: parent.verticalCenter
+      leftPadding: Style.space(2)
+      rightPadding: Style.space(2)
+      visible: root.showBarControls
+      textFormat: Text.PlainText
+      text: "󰒭"
+      color: barNextMouse.containsMouse ? Color.accent : root.bar.barForeground
+      opacity: enabled ? 1 : 0.4
+      font.family: root.bar.fontFamily
+      font.pixelSize: Style.font.icon
+
+      MouseArea {
+        id: barNextMouse
+        anchors.fill: parent
+        anchors.margins: -Style.space(3)
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        enabled: !root.actionBusy
+        onClicked: root.runAction("next")
+      }
+    }
+
+    Text {
+      id: barLike
+      anchors.verticalCenter: parent.verticalCenter
+      leftPadding: Style.space(2)
+      rightPadding: Style.space(2)
+      visible: root.showBarControls && root.playbackId !== ""
+      textFormat: Text.PlainText
+      text: "󰋑"
+      color: barLikeMouse.containsMouse ? Color.accent : root.liked ? Color.accent : root.bar.barForeground
+      opacity: root.likeBusy ? 0.5 : 1
+      font.family: root.bar.fontFamily
+      font.pixelSize: Style.font.icon
+
+      MouseArea {
+        id: barLikeMouse
+        anchors.fill: parent
+        anchors.margins: -Style.space(3)
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        enabled: !root.likeBusy
+        onClicked: root.toggleLike()
+      }
+    }
   }
 
   MouseArea {
@@ -769,6 +987,28 @@ BarWidget {
           selected: root.selectedTab === "feed"
           onClicked: root.selectTab("feed")
         }
+
+        Button {
+          text: "Search"
+          foreground: root.bar.foreground
+          selected: root.selectedTab === "search"
+          onClicked: root.selectTab("search")
+        }
+      }
+
+      TextField {
+        id: searchField
+        width: parent.width
+        visible: root.running && root.loggedIn && root.selectedTab === "search"
+        foreground: root.bar.foreground
+        accent: Color.accent
+        placeholderText: "Search SoundCloud tracks"
+        maximumLength: 120
+        onAccepted: root.runSearch(text)
+        Keys.onEscapePressed: {
+          if (text !== "") text = ""
+          else root.close()
+        }
       }
 
       Item {
@@ -938,7 +1178,8 @@ BarWidget {
           anchors.centerIn: parent
           visible: root.tracksLoading && root.tracks.length === 0
           textFormat: Text.PlainText
-          text: "Loading " + (root.selectedTab === "home" ? "Home" : "Feed") + "…"
+          text: root.selectedTab === "search" ? "Searching…"
+            : "Loading " + (root.selectedTab === "home" ? "Home" : "Feed") + "…"
           color: root.dim
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.body
@@ -952,7 +1193,8 @@ BarWidget {
           Text {
             anchors.horizontalCenter: parent.horizontalCenter
             textFormat: Text.PlainText
-            text: "No tracks found"
+            text: root.selectedTab !== "search" ? "No tracks found"
+              : (root.searchQuery === "" ? "Type a search and press Enter" : "No results for “" + root.searchQuery + "”")
             color: root.dim
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.body
@@ -961,9 +1203,11 @@ BarWidget {
           Button {
             anchors.horizontalCenter: parent.horizontalCenter
             text: "Retry"
+            visible: root.selectedTab !== "search" || root.searchQuery !== ""
             foreground: root.bar.foreground
             enabled: !root.actionBusy
-            onClicked: root.selectTab(root.selectedTab)
+            onClicked: root.selectedTab === "search"
+              ? root.runSearch(root.searchQuery) : root.selectTab(root.selectedTab)
           }
         }
       }
@@ -1002,6 +1246,19 @@ BarWidget {
         wrapMode: Text.WordWrap
       }
 
+    }
+  }
+
+  Timer {
+    id: searchFocusTimer
+    property int attempts: 0
+    interval: 40
+    repeat: true
+    onTriggered: {
+      attempts += 1
+      if (root.popupOpen && root.selectedTab === "search" && searchField.visible)
+        searchField.forceActiveFocus()
+      if (searchField.activeFocus || attempts >= 15 || !root.popupOpen) stop()
     }
   }
 
