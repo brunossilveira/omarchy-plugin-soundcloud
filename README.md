@@ -17,7 +17,17 @@ without official SoundCloud API credentials.
 - SoundCloud-style waveform progress display with click-to-seek
 - Heart button to like or unlike the current track on your SoundCloud account
 - Home and Feed tabs that load more tracks as you scroll
-- Search tab: type a query and press Enter to search SoundCloud tracks
+- Likes tab with your liked tracks
+- Search tab for tracks, playlists, and artists; open a playlist or artist to see
+  and play its tracks
+- Next/previous walk the list a track was played from, and the next track starts
+  when one ends; previous restarts the track after its first 3 seconds
+- Volume slider in the popup; scroll over the bar's play button to change volume
+- Media keys and Omarchy's media controls work through MPRIS
+- The last track, its position, its list, and the volume are remembered across
+  restarts; press play to resume where you stopped
+- Opening Home or Feed keeps a track loaded in SoundCloud's web player instead of
+  reloading the page; the refresh button reloads the list on demand
 - Only one player is ever audible: starting SoundCloud's web player pauses the bar's
   player and vice versa, and closing the SoundCloud window pauses the web player
 - Persistent SoundCloud login session
@@ -120,6 +130,7 @@ not require another sign-in:
 
 - `cookies.json`: the SoundCloud session cookies
 - `tracks.json`: the cached Home and Feed track lists (titles, artists, links)
+- `player.json`: the volume, last track, its position, and its list
 
 The runtime directory `$XDG_RUNTIME_DIR/omarchy-soundcloud/` (lock file and the
 optional `pagination.log`) is also kept until logout.

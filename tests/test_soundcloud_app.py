@@ -1999,7 +1999,9 @@ class BarWidgetTest(unittest.TestCase):
     def test_popup_uses_seekable_waveform_instead_of_feed_buttons(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
 
-        self.assertNotIn('text: "Likes"', qml)
+        # Likes is a list tab fed by the API, not a button that navigates the page.
+        self.assertNotIn('runAction("likes"', qml)
+        self.assertIn('sendCommand("likes", "likes")', qml)
         self.assertNotIn('text: "Following"', qml)
         self.assertIn("Canvas {", qml)
         self.assertIn('root.runAction("seek"', qml)
@@ -2008,7 +2010,7 @@ class BarWidgetTest(unittest.TestCase):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
 
         self.assertIn("Style.space(408)", qml)
-        self.assertIn("Style.space(480)", qml)
+        self.assertIn("Style.space(560)", qml)
         self.assertIn('text: "Home"', qml)
         self.assertIn('text: "Feed"', qml)
         self.assertIn("ListView {", qml)

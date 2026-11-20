@@ -32,6 +32,14 @@ BarWidget {
   property var homeTracks: []
   property var feedTracks: []
   property var searchTracks: []
+  property string searchKind: "tracks"
+  property var likesTracks: []
+  property bool likesPending: false
+  property bool likesLoaded: false
+  property var openedCollection: null
+  property var collectionTracks: []
+  property bool collectionPending: false
+  property real volume: 1
   property string searchQuery: ""
   property bool searchPending: false
   property var trackArtworkData: ({})
@@ -106,8 +114,16 @@ BarWidget {
     launcherProcess.running = true
   }
 
+  function isPageTab(tab) { return tab === "home" || tab === "feed" }
+
+  // The list a played track belongs to; the backend queues it for next/previous.
+  function listSource() {
+    if (selectedTab === "search") return openedCollection ? "collection" : "search"
+    return selectedTab
+  }
+
   function refreshTracks() {
-    if (selectedTab === "search") return
+    if (!isPageTab(selectedTab)) return
     if (!popupOpen || tracksRequestPending || !backendConnected || !running || !loggedIn) return
     tracksLoading = true
     trackLoadAttempts += 1
@@ -117,9 +133,16 @@ BarWidget {
   function selectTab(tab) {
     if (tab === "search") {
       selectedTab = tab
-      tracks = searchTracks
-      tracksLoading = searchPending
-      focusSearchField()
+      tracks = openedCollection ? collectionTracks : searchTracks
+      tracksLoading = openedCollection ? collectionPending : searchPending
+      if (!openedCollection) focusSearchField()
+      return
+    }
+    if (tab === "likes") {
+      selectedTab = tab
+      tracks = likesTracks
+      tracksLoading = likesPending || !likesLoaded
+      if (!likesLoaded && !likesPending) loadLikes()
       return
     }
     selectedTab = tab
@@ -143,28 +166,140 @@ BarWidget {
     if (query === "" || !backendConnected || !running || !loggedIn) return
     searchQuery = query
     searchPending = true
+    openedCollection = null
     lastError = ""
-    if (selectedTab === "search") tracksLoading = true
-    if (sendCommand("search:" + query, "search") === 0) {
+    if (selectedTab === "search") {
+      tracks = []
+      tracksLoading = true
+    }
+    var prefix = searchKind === "playlists" ? "search-playlists:"
+      : (searchKind === "users" ? "search-users:" : "search:")
+    if (sendCommand(prefix + query, "search") === 0) {
       searchPending = false
       tracksLoading = false
     }
   }
 
+  function setSearchKind(kind) {
+    if (searchKind === kind) return
+    searchKind = kind
+    if (searchQuery !== "") runSearch(searchQuery)
+    else focusSearchField()
+  }
+
   function applySearchResult(message) {
-    if (String(message.query || "") !== searchQuery) return
+    var kind = String(message.kind || "tracks")
+    if (String(message.query || "") !== searchQuery || kind !== searchKind) return
     searchPending = false
-    searchTracks = Array.isArray(message.tracks) ? message.tracks.slice(0, 100) : []
+    if (kind === "tracks") {
+      searchTracks = Array.isArray(message.tracks) ? message.tracks.slice(0, 100) : []
+    } else {
+      // Playlists and artists open into their tracks when clicked.
+      var rows = []
+      var collections = Array.isArray(message.collections) ? message.collections : []
+      for (var index = 0; index < collections.length && index < 50; index++) {
+        var item = collections[index]
+        rows.push({
+          collection: true, kind: String(item.kind || ""), id: Number(item.id) || 0,
+          title: String(item.title || ""), artist: String(item.subtitle || ""),
+          artworkId: String(item.artworkId || "")
+        })
+      }
+      searchTracks = rows
+    }
     if (message.ok !== true) lastError = String(message.error || "SoundCloud search failed")
-    if (selectedTab === "search") {
+    if (selectedTab === "search" && !openedCollection) {
       tracks = searchTracks
       tracksLoading = false
       trackList.contentY = trackList.originY
     }
   }
 
+  function openCollection(row) {
+    if (!row || !row.collection || !(row.id > 0)) return
+    openedCollection = { kind: row.kind, id: row.id, title: row.title }
+    collectionTracks = []
+    collectionPending = true
+    lastError = ""
+    tracksLoading = true
+    tracks = collectionTracks
+    if (sendCommand("open:" + row.kind + ":" + row.id, "collection") === 0) {
+      collectionPending = false
+      tracksLoading = false
+    }
+  }
+
+  function closeCollection() {
+    openedCollection = null
+    collectionPending = false
+    if (selectedTab === "search") {
+      tracks = searchTracks
+      tracksLoading = searchPending
+    }
+  }
+
+  function applyCollectionResult(message) {
+    if (!openedCollection || Number(message.id) !== openedCollection.id) return
+    collectionPending = false
+    collectionTracks = Array.isArray(message.tracks) ? message.tracks.slice(0, 100) : []
+    if (message.ok !== true) lastError = String(message.error || "SoundCloud could not open this")
+    if (selectedTab === "search") {
+      tracks = collectionTracks
+      tracksLoading = false
+      trackList.contentY = trackList.originY
+    }
+  }
+
+  function loadLikes() {
+    if (likesPending || !backendConnected || !running || !loggedIn) return
+    likesPending = true
+    if (selectedTab === "likes") tracksLoading = true
+    if (sendCommand("likes", "likes") === 0) {
+      likesPending = false
+      if (selectedTab === "likes") tracksLoading = false
+    }
+  }
+
+  function applyLikesResult(message) {
+    likesPending = false
+    if (message.ok === true) {
+      likesLoaded = true
+      likesTracks = Array.isArray(message.tracks) ? message.tracks.slice(0, 100) : []
+    } else {
+      lastError = String(message.error || "SoundCloud could not load your likes")
+    }
+    if (selectedTab === "likes") {
+      tracks = likesTracks
+      tracksLoading = false
+    }
+  }
+
+  function refreshCurrentList() {
+    lastError = ""
+    if (isPageTab(selectedTab)) {
+      tracksLoading = true
+      trackLoadAttempts = 0
+      sendCommand("refresh:" + selectedTab, "refresh")
+      trackReloadTimer.restart()
+    } else if (selectedTab === "likes") {
+      loadLikes()
+    } else if (openedCollection) {
+      openCollection({ collection: true, kind: openedCollection.kind,
+        id: openedCollection.id, title: openedCollection.title })
+    } else if (searchQuery !== "") {
+      runSearch(searchQuery)
+    }
+  }
+
+  function setVolume(value) {
+    var next = Math.max(0, Math.min(1, Number(value)))
+    if (!isFinite(next)) return
+    volume = Math.round(next * 100) / 100
+    volumeSendTimer.restart()
+  }
+
   function loadMoreTracks(yPosition, heightRatio, atEnd, userInitiated) {
-    if (selectedTab === "search") return
+    if (!isPageTab(selectedTab)) return
     var requestedCount = selectedTab === "home" ? homeLoadMoreAtCount : feedLoadMoreAtCount
     var hasMore = selectedTab === "home" ? homeHasMore : feedHasMore
     if (!backendConnected || !running || !loggedIn
@@ -253,7 +388,7 @@ BarWidget {
   function commandValue(action, value) {
     if (action === "launch") return "show"
     if (action === "seek") return "seek:" + String(value)
-    if (action === "play") return "play:" + String(value)
+    if (action === "play") return "play-in:" + listSource() + ":" + String(value)
     return action
   }
 
@@ -282,7 +417,7 @@ BarWidget {
     reconnectAttempt = 0
     sendCommand("subscribe", "subscribe")
     sendCommand("status", "status")
-    if (popupOpen && running && loggedIn && selectedTab !== "search") {
+    if (popupOpen && running && loggedIn && isPageTab(selectedTab)) {
       sendCommand(selectedTab, "action")
       trackReloadTimer.restart()
     }
@@ -296,6 +431,8 @@ BarWidget {
     homeLoadMorePending = false
     feedLoadMorePending = false
     searchPending = false
+    likesPending = false
+    collectionPending = false
     trackArtworkPending = ({})
     tracksLoading = false
     trackLoadAttempts = 0
@@ -371,6 +508,8 @@ BarWidget {
     loggedIn = state.loggedIn === true || (root.loggedIn && !reportsLoggedOut)
     if (state.error) lastError = String(state.error)
     playbackState = String(state.playbackState || (state.playing === true ? "playing" : "idle"))
+    if (typeof state.volume === "number" && isFinite(state.volume) && !volumeSendTimer.running)
+      volume = Math.max(0, Math.min(1, state.volume))
     if (selectionBusy && !SoundCloudModel.selectionIsPending(playbackState)) {
       selectionBusy = false
       activeSelectionRequestId = 0
@@ -396,7 +535,7 @@ BarWidget {
       artist = String(state.artist || "").slice(0, 256)
       waveformLevels = Array.isArray(state.waveform) ? state.waveform : []
     }
-    if (popupOpen && loggedIn && !wasLoggedIn && tracks.length === 0 && selectedTab !== "search") {
+    if (popupOpen && loggedIn && !wasLoggedIn && tracks.length === 0 && isPageTab(selectedTab)) {
       sendCommand(selectedTab, "action")
       trackReloadTimer.restart()
     }
@@ -476,6 +615,10 @@ BarWidget {
       }
     } else if (kind === "search") {
       applySearchResult(message)
+    } else if (kind === "likes") {
+      applyLikesResult(message)
+    } else if (kind === "collection") {
+      applyCollectionResult(message)
     } else if (kind === "like") {
       likeBusy = false
       if (message.ok !== true) lastError = String(message.error || "SoundCloud could not update this like")
@@ -655,6 +798,11 @@ BarWidget {
         cursorShape: Qt.PointingHandCursor
         enabled: !root.actionBusy
         onClicked: root.runAction("play-pause")
+        onWheel: function(wheel) {
+          root.setVolume(root.volume + (wheel.angleDelta.y > 0 ? 0.05 : -0.05))
+          root.bar.showTooltip(root, "Volume " + Math.round(root.volume * 100) + "%")
+        }
+        onExited: root.bar.hideTooltip(root)
       }
     }
 
@@ -733,7 +881,7 @@ BarWidget {
     owner: root
     open: root.popupOpen
     contentWidth: popup.fittedContentWidth(Style.space(408))
-    contentHeight: popup.fittedContentHeight(Style.space(480))
+    contentHeight: popup.fittedContentHeight(Style.space(560))
 
     Column {
       id: content
@@ -969,6 +1117,44 @@ BarWidget {
       }
 
       Row {
+        width: parent.width
+        spacing: Style.space(8)
+        visible: root.running && root.loggedIn
+
+        Text {
+          id: volumeIcon
+          anchors.verticalCenter: parent.verticalCenter
+          textFormat: Text.PlainText
+          text: "󰕾"
+          color: root.dim
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.icon
+        }
+
+        PanelSlider {
+          anchors.verticalCenter: parent.verticalCenter
+          width: parent.width - volumeIcon.width - volumePercent.width - parent.spacing * 2
+          bar: root.bar
+          value: root.volume
+          step: 0.01
+          onMoved: function(value) { root.setVolume(value) }
+          onReleased: function(value) { root.setVolume(value) }
+        }
+
+        Text {
+          id: volumePercent
+          anchors.verticalCenter: parent.verticalCenter
+          width: Style.space(34)
+          horizontalAlignment: Text.AlignRight
+          textFormat: Text.PlainText
+          text: Math.round(root.volume * 100) + "%"
+          color: root.dim
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+      }
+
+      Row {
         spacing: Style.space(8)
         visible: root.running && root.loggedIn
 
@@ -989,10 +1175,24 @@ BarWidget {
         }
 
         Button {
+          text: "Likes"
+          foreground: root.bar.foreground
+          selected: root.selectedTab === "likes"
+          onClicked: root.selectTab("likes")
+        }
+
+        Button {
           text: "Search"
           foreground: root.bar.foreground
           selected: root.selectedTab === "search"
           onClicked: root.selectTab("search")
+        }
+
+        Button {
+          iconText: "󰑐"
+          foreground: root.bar.foreground
+          enabled: !root.actionBusy
+          onClicked: root.refreshCurrentList()
         }
       }
 
@@ -1002,12 +1202,54 @@ BarWidget {
         visible: root.running && root.loggedIn && root.selectedTab === "search"
         foreground: root.bar.foreground
         accent: Color.accent
-        placeholderText: "Search SoundCloud tracks"
+        placeholderText: root.searchKind === "playlists" ? "Search SoundCloud playlists"
+          : (root.searchKind === "users" ? "Search SoundCloud artists" : "Search SoundCloud tracks")
         maximumLength: 120
         onAccepted: root.runSearch(text)
         Keys.onEscapePressed: {
           if (text !== "") text = ""
           else root.close()
+        }
+      }
+
+      Row {
+        spacing: Style.space(6)
+        visible: searchField.visible && !root.openedCollection
+
+        Repeater {
+          model: [["tracks", "Tracks"], ["playlists", "Playlists"], ["users", "Artists"]]
+          delegate: Button {
+            required property var modelData
+            text: modelData[1]
+            foreground: root.bar.foreground
+            selected: root.searchKind === modelData[0]
+            onClicked: root.setSearchKind(modelData[0])
+          }
+        }
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.space(8)
+        visible: root.running && root.loggedIn && root.selectedTab === "search" && !!root.openedCollection
+
+        Button {
+          id: collectionBack
+          iconText: "󰅁"
+          foreground: root.bar.foreground
+          onClicked: root.closeCollection()
+        }
+
+        Text {
+          anchors.verticalCenter: parent.verticalCenter
+          width: parent.width - collectionBack.width - parent.spacing
+          textFormat: Text.PlainText
+          text: root.openedCollection ? root.openedCollection.title : ""
+          color: root.bar.foreground
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.body
+          font.bold: true
+          elide: Text.ElideRight
         }
       }
 
@@ -1143,7 +1385,7 @@ BarWidget {
               anchors.right: parent.right
               anchors.rightMargin: Style.space(6)
               anchors.verticalCenter: parent.verticalCenter
-              text: root.trackDuration(track)
+              text: track.collection ? "󰅂" : root.trackDuration(track)
               textFormat: Text.PlainText
               color: root.dim
               font.family: root.bar.fontFamily
@@ -1155,10 +1397,11 @@ BarWidget {
               anchors.fill: parent
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
-              enabled: (!root.actionBusy || root.selectionBusy)
-                && /^soundcloud:tracks:[1-9][0-9]*$/.test(String(track.playbackId || ""))
+              enabled: track.collection === true || ((!root.actionBusy || root.selectionBusy)
+                && /^soundcloud:tracks:[1-9][0-9]*$/.test(String(track.playbackId || "")))
               onClicked: {
-                root.runAction("play", modelData.playbackId)
+                if (track.collection === true) root.openCollection(modelData)
+                else root.runAction("play", modelData.playbackId)
               }
             }
           }
@@ -1178,8 +1421,8 @@ BarWidget {
           anchors.centerIn: parent
           visible: root.tracksLoading && root.tracks.length === 0
           textFormat: Text.PlainText
-          text: root.selectedTab === "search" ? "Searching…"
-            : "Loading " + (root.selectedTab === "home" ? "Home" : "Feed") + "…"
+          text: root.selectedTab === "search" ? (root.openedCollection ? "Loading tracks…" : "Searching…")
+            : "Loading " + ({ home: "Home", feed: "Feed", likes: "Likes" })[root.selectedTab] + "…"
           color: root.dim
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.body
@@ -1193,8 +1436,9 @@ BarWidget {
           Text {
             anchors.horizontalCenter: parent.horizontalCenter
             textFormat: Text.PlainText
-            text: root.selectedTab !== "search" ? "No tracks found"
-              : (root.searchQuery === "" ? "Type a search and press Enter" : "No results for “" + root.searchQuery + "”")
+            text: root.selectedTab === "likes" ? "No liked tracks yet"
+              : (root.selectedTab !== "search" || root.openedCollection ? "No tracks found"
+              : (root.searchQuery === "" ? "Type a search and press Enter" : "No results for “" + root.searchQuery + "”"))
             color: root.dim
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.body
@@ -1206,8 +1450,7 @@ BarWidget {
             visible: root.selectedTab !== "search" || root.searchQuery !== ""
             foreground: root.bar.foreground
             enabled: !root.actionBusy
-            onClicked: root.selectedTab === "search"
-              ? root.runSearch(root.searchQuery) : root.selectTab(root.selectedTab)
+            onClicked: root.refreshCurrentList()
           }
         }
       }
@@ -1247,6 +1490,14 @@ BarWidget {
       }
 
     }
+  }
+
+  // Coalesce slider drags and wheel ticks into one volume command.
+  Timer {
+    id: volumeSendTimer
+    interval: 90
+    repeat: false
+    onTriggered: root.sendCommand("volume:" + root.volume.toFixed(2), "volume")
   }
 
   Timer {
