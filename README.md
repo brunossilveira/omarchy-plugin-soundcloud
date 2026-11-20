@@ -20,8 +20,13 @@ without official SoundCloud API credentials.
 - Likes tab with your liked tracks
 - Search tab for tracks, playlists, and artists; open a playlist or artist to see
   and play its tracks
+- Mixes tab with your SoundCloud mixes, "More of what you like" related-track
+  lists, artist stations, and recommended playlists; open one to play its tracks
+- Shuffle button plays the current list (Home, Feed, Likes, a mix or playlist, or
+  track search results) in random order
 - Next/previous walk the list a track was played from, and the next track starts
   when one ends; previous restarts the track after its first 3 seconds
+- When a list runs out, playback carries on with tracks related to the last one
 - Volume slider in the popup; scroll over the bar's play button to change volume
 - Media keys and Omarchy's media controls work through MPRIS
 - The last track, its position, its list, and the volume are remembered across

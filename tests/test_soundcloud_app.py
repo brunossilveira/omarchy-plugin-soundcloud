@@ -2516,3 +2516,51 @@ eval({json.dumps(app.api_request_capture_script())});
         self.assertIn("Number(message.collectionId) !== openedCollection.id", source)
         self.assertNotIn("Number(message.id) !== openedCollection.id", source)
         self.assertIn('{"kind": kind, "collectionId": identifier}', backend)
+
+
+class RelatedAutoplayTest(unittest.TestCase):
+    PRELUDE = SearchAndPlayerHandoffTest.HARNESS_PRELUDE
+    api_track = staticmethod(QueueLibraryAndMprisTest.api_track)
+
+    @staticmethod
+    def track(number):
+        return {"playbackId": f"soundcloud:tracks:{number}", "title": f"T{number}"}
+
+    def test_extend_queue_skips_known_tracks_and_stays_bounded(self):
+        app = load_module()
+        queue = [self.track(n) for n in range(1, 4)]
+        extended, index = app.extend_queue(queue, 2, [self.track(3), self.track(4), {"playbackId": "x"}])
+        self.assertEqual([t["playbackId"] for t in extended][-2:], ["soundcloud:tracks:3", "soundcloud:tracks:4"])
+        self.assertEqual(index, 2)
+        full = [self.track(n) for n in range(1, app.MAX_QUEUE + 1)]
+        extended, index = app.extend_queue(full, app.MAX_QUEUE - 1, [self.track(n) for n in range(500, 520)])
+        self.assertEqual(len(extended), app.MAX_QUEUE)
+        self.assertEqual(extended[index]["playbackId"], f"soundcloud:tracks:{app.MAX_QUEUE}")
+        self.assertEqual(extended[index + 1]["playbackId"], "soundcloud:tracks:500")
+
+    def test_related_tracks_come_from_the_tracks_related_endpoint(self):
+        app = load_module()
+        related = json.dumps({"collection": [self.api_track(11, "Near"), self.api_track(12, "Nearer")]})
+        harness = self.PRELUDE + f"""
+global.document = {{ querySelector() {{ return null; }}, querySelectorAll() {{ return []; }} }};
+window.fetch = async function(input) {{
+  const url = typeof input === 'string' ? input : input.url;
+  calls.push(url);
+  const payload = url.includes('/tracks/10/related') ? {related} : {{ collection: [] }};
+  return new Response(JSON.stringify(payload), {{ status: 200 }});
+}};
+eval({json.dumps(app.api_request_capture_script())});
+(async () => {{
+  await window.fetch(new Request('https://api-v2.soundcloud.com/me?client_id=public-test',
+    {{ headers: {{ authorization: 'OAuth private-test-value' }} }}));
+  const found = JSON.parse(await window.__omarchyRelated(10));
+  const refused = JSON.parse(await window.__omarchyRelated('nope'));
+  process.stdout.write(JSON.stringify({{ found, refused }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+        completed = subprocess.run(["node", "-e", harness], check=True, capture_output=True, text=True)
+        result = json.loads(completed.stdout)
+        self.assertEqual([t["title"] for t in result["found"]["tracks"]], ["Near", "Nearer"])
+        self.assertIn("error", result["refused"])
+        self.assertNotIn("private-test-value", completed.stdout)
+        self.assertIsNotNone(app.validate_tracks_payload(result["found"]))

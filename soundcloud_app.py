@@ -1643,6 +1643,17 @@ def api_request_capture_script() -> str:
           return JSON.stringify({ tracks: [], error: failure(error) });
         }
       };
+      // Tracks SoundCloud relates to one track, for autoplay after a list ends.
+      window.__omarchyRelated = async function(value) {
+        const id = positiveId(Number(value));
+        if (!id) return JSON.stringify({ tracks: [], error: 'SoundCloud could not find related tracks' });
+        try {
+          const { payload, context } = await apiGet('/tracks/' + id + '/related', { limit: 20 });
+          return JSON.stringify({ tracks: normaliseEach(payload, context).slice(0, 20) });
+        } catch (error) {
+          return JSON.stringify({ tracks: [], error: failure(error) });
+        }
+      };
       window.__omarchyLikes = async function() {
         try {
           const me = await apiGet('/me', {});
@@ -2238,6 +2249,10 @@ OPEN_COLLECTION_FUNCTION = f"""
 if (typeof window.__omarchyOpenCollection !== 'function') {PAGE_FUNCTION_MISSING}
 return await window.__omarchyOpenCollection(kind, id);
 """
+RELATED_TRACKS_FUNCTION = f"""
+if (typeof window.__omarchyRelated !== 'function') {PAGE_FUNCTION_MISSING}
+return await window.__omarchyRelated(id);
+"""
 MIXES_FUNCTION = f"""
 if (typeof window.__omarchyMixes !== 'function') {PAGE_FUNCTION_MISSING}
 return await window.__omarchyMixes();
@@ -2274,6 +2289,22 @@ def search_query_from_command(command: str) -> str | None:
 def collection_from_command(command: str) -> tuple[str, int] | None:
     match = re.fullmatch(r"open:(playlist|user|mix):([1-9][0-9]{0,15})", command)
     return (match.group(1), int(match.group(2))) if match else None
+
+
+def extend_queue(queue: list[dict[str, object]], index: int,
+                 extra: list[dict[str, object]]) -> tuple[list[dict[str, object]], int]:
+    """Append unseen playable tracks, dropping played ones so the queue stays bounded."""
+    known = {track.get("playbackId") for track in queue}
+    added = []
+    for track in extra:
+        playback_id = track.get("playbackId")
+        if is_playback_id(playback_id) and playback_id not in known:
+            known.add(playback_id)
+            added.append(track)
+    combined = list(queue) + added
+    overflow = max(0, len(combined) - MAX_QUEUE)
+    overflow = min(overflow, max(0, index))
+    return combined[overflow:][:MAX_QUEUE], index - overflow
 
 
 def shuffle_from_command(command: str) -> str | None:
@@ -3901,6 +3932,10 @@ def build_application(show_on_start: bool = False):
 
         def _advance(self, step, done=None):
             target = queue_step(len(self.queue), self.queue_index, step)
+            if target is None and step == 1 and self.queue:
+                # The list is over; carry on with tracks related to the last one.
+                self._autoplay_related(done)
+                return True
             if target is None:
                 if done:
                     done(False, "No more tracks in this list")
@@ -3908,6 +3943,43 @@ def build_application(show_on_start: bool = False):
             self.queue_index = target
             self._start_track(self.queue[target]["playbackId"], done)
             return True
+
+        def _autoplay_related(self, done=None):
+            finish = done or (lambda _ok, _error: None)
+            last = self.queue[self.queue_index] if 0 <= self.queue_index < len(self.queue) else self.queue[-1]
+            playback_id = str(last.get("playbackId") or "")
+            if not is_playback_id(playback_id) or not self.webview \
+                    or not is_soundcloud_uri(self.webview.get_uri() or ""):
+                finish(False, "No more tracks in this list")
+                return
+            generation = self.selection_generation
+
+            def finished(webview, async_result, _data):
+                try:
+                    value = webview.call_async_javascript_function_finish(async_result)
+                    raw = value.to_string() if value.is_string() else ""
+                    payload = json.loads(raw) if raw and len(raw.encode("utf-8")) <= MAX_RESPONSE_BYTES else {}
+                except Exception:
+                    payload = {}
+                validated = validate_tracks_payload({"tracks": payload.get("tracks", [])}) \
+                    if isinstance(payload, dict) else None
+                if generation != self.selection_generation:
+                    finish(False, "selection superseded")
+                    return
+                queue, index = extend_queue(self.queue, self.queue_index, validated["tracks"] if validated else [])
+                if index + 1 >= len(queue):
+                    finish(False, "No more tracks in this list")
+                    return
+                for track in queue[index + 1:]:
+                    self.playback_tracks.setdefault(track["playbackId"], track)
+                self.queue, self.queue_index = queue, index + 1
+                self._start_track(queue[index + 1]["playbackId"], finish)
+
+            self.webview.call_async_javascript_function(
+                RELATED_TRACKS_FUNCTION, -1,
+                GLib.Variant("a{sv}", {"id": GLib.Variant("d", float(playback_id.rpartition(":")[2]))}),
+                None, None, None, finished, None,
+            )
 
         def _playback_changed(self):
             if self.pending_seek and self.playback.playing:
